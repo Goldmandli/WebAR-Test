@@ -27,6 +27,8 @@
 <video id="v" playsinline muted></video>
 <canvas id="c"></canvas>
 <div id="hud">
+  <div id="leg" style="display:flex;height:10px;border-radius:3px;overflow:hidden"></div>
+  <div style="display:flex;justify-content:space-between;font-size:11px;opacity:.75;margin-bottom:4px"><span>vor 1919</span><span>ab 2021</span></div>
   <div id="status">Warte auf GPS …</div>
   <div id="dbg"></div>
   Sichtfeld (horizontal): <span id="fovv">55</span>°
@@ -99,20 +101,42 @@ $('file').onchange = async e => {
   $('msg').textContent = feats.length + ' Gebäude aus Datei';
 };
 
+/* ===== Bauperioden & Farben (Viridis, ähnlich GIS-Browser) ===== */
+const PERIODS = [[0,1918,'vor 1919'],[1919,1945,'1919–1945'],[1946,1960,'1946–1960'],[1961,1970,'1961–1970'],
+  [1971,1980,'1971–1980'],[1981,1985,'1981–1985'],[1986,1990,'1986–1990'],[1991,1995,'1991–1995'],
+  [1996,2000,'1996–2000'],[2001,2005,'2001–2005'],[2006,2010,'2006–2010'],[2011,2015,'2011–2015'],
+  [2016,2020,'2016–2020'],[2021,9999,'ab 2021']];
+const VIR = [[0,'#440154'],[.13,'#482878'],[.25,'#3e4989'],[.38,'#31688e'],[.5,'#26828e'],
+  [.63,'#1f9e89'],[.75,'#35b779'],[.88,'#6ece58'],[.94,'#b5de2b'],[1,'#fde725']];
+function viridis(t){
+  let i = 1; while(i < VIR.length-1 && t > VIR[i][0]) i++;
+  const [t0,c0] = VIR[i-1], [t1,c1] = VIR[i], f = (t-t0)/(t1-t0);
+  const a = [1,3,5].map(k => parseInt(c0.substr(k,2),16)), b = [1,3,5].map(k => parseInt(c1.substr(k,2),16));
+  return 'rgb(' + a.map((v,k) => Math.round(v + (b[k]-v)*f)).join(',') + ')';
+}
+const COLORS = PERIODS.map((_,i) => viridis(i/(PERIODS.length-1)));
+$('leg').innerHTML = COLORS.map(c => `<div style="flex:1;background:${c}"></div>`).join('');
+
 /* ===== Attribute auslesen ===== */
 function findYearKey(props){
   if(CFG.fieldYear) return CFG.fieldYear;
   const keys = Object.keys(props);
-  return keys.find(k => /baujahr|bauperiode|gebaeudealter|geb_alter|alter|jahr/i.test(k)) || null;
+  for(const re of [/^(gbauj|baujahr)/i, /^(gbaup|bauperiode)/i, /bauj|baup|gebaeudealter|alter|jahr|period/i]){
+    const k = keys.find(k => re.test(k)); if(k) return k;
+  }
+  return null;
 }
 function ageInfo(props){
   const k = yearKey || (yearKey = findYearKey(props));
-  const raw = k ? props[k] : null;
-  const years = String(raw ?? '').match(/\d{4}/g);
-  if(!years) return { text: raw != null ? String(raw) : 'Baujahr unbekannt', year: NaN };
-  const y = years.map(Number);
-  const year = y.reduce((a,b) => a+b, 0)/y.length;
-  return { text: y.length > 1 ? `Bauperiode ${y[0]}–${y[1]}` : `Baujahr ${y[0]}`, year };
+  const raw = k ? props[k] : null, s = String(raw ?? '');
+  const ys = s.match(/\d{4}/g);
+  if(!ys) return { text: s !== '' ? s : 'Baujahr unbekannt', cls: -1, year: NaN };
+  const v = +ys[0];
+  if(ys.length === 1 && v >= 8011 && v < 8011 + PERIODS.length)      // GWR-Code der Bauperiode
+    return { text: 'Bauperiode ' + PERIODS[v-8011][2], cls: v-8011, year: NaN };
+  const y = ys.map(Number), m = y.reduce((a,b) => a+b, 0)/y.length;
+  return { text: y.length > 1 ? `Bauperiode ${y[0]}–${y[1]}` : `Baujahr ${y[0]}`,
+           cls: PERIODS.findIndex(p => m >= p[0] && m <= p[1]), year: y.length > 1 ? NaN : y[0] };
 }
 
 /* ===== Geometrie ===== */
@@ -146,7 +170,6 @@ function project(x, y, z){
   const W = cv.width, H = cv.height, th = Math.tan(hfov/2*rad), tv = th*H/W;
   return { x: W/2 + Math.tan(rel*rad)/th*W/2, y: H/2 - Math.tan(el*rad)/tv*H/2 };
 }
-const ageColor = age => `hsl(${140 - Math.max(0, Math.min(200, age))*0.7}, 75%, 50%)`;
 
 /* ===== Zeichnen ===== */
 function draw(){
@@ -157,7 +180,7 @@ function draw(){
     ctx.lineWidth = 2*devicePixelRatio;
     for(const b of list){
       const isT = b === target, info = ageInfo(b.f.props);
-      const age = now - info.year, col = isNaN(age) ? '#aaa' : ageColor(age);
+      const age = now - info.year, col = info.cls >= 0 ? COLORS[info.cls] : '#aaa';
       const h = +b.f.props[CFG.fieldHeight] || CFG.defaultHeight;
       for(const ring of b.rs){
         const gr = ring.map(p => project(p.x,p.y,0)), rf = ring.map(p => project(p.x,p.y,h));
@@ -165,8 +188,8 @@ function draw(){
           const q = [gr[i],gr[i+1],rf[i+1],rf[i]];
           if(q.some(v => !v)) continue;
           ctx.beginPath(); q.forEach((v,k) => k ? ctx.lineTo(v.x,v.y) : ctx.moveTo(v.x,v.y)); ctx.closePath();
-          ctx.globalAlpha = isT ? .45 : .08; ctx.fillStyle = col; ctx.fill();
-          ctx.globalAlpha = isT ? 1 : .35; ctx.strokeStyle = col; ctx.stroke();
+          ctx.globalAlpha = isT ? .55 : .35; ctx.fillStyle = col; ctx.fill();
+          ctx.globalAlpha = isT ? 1 : .6; ctx.strokeStyle = col; ctx.stroke();
         }
       }
       if(isT){
@@ -177,7 +200,7 @@ function draw(){
         const w = ctx.measureText(txt).width + 24*devicePixelRatio;
         ctx.fillStyle = 'rgba(0,0,0,.75)'; ctx.fillRect(x-w/2, y-fs, w, fs*1.7);
         ctx.fillStyle = col; ctx.fillText(txt, x, y+fs*0.3);
-        $('dbg').textContent = JSON.stringify(b.f.props).slice(0,160);   // Attribute zum Prüfen
+        $('dbg').textContent = JSON.stringify(b.f.props).slice(0,500);   // Attribute zum Prüfen
       }
     }
     ctx.globalAlpha = 1;
