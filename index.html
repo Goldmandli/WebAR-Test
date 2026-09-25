@@ -28,8 +28,8 @@
 <video id="v" playsinline muted></video>
 <canvas id="c"></canvas>
 <div id="hud">
-  <div id="leg" style="display:flex;height:10px;border-radius:3px;overflow:hidden"></div>
-  <div style="display:flex;justify-content:space-between;font-size:11px;opacity:.75;margin-bottom:4px"><span>vor 1850</span><span>ab 2021</span></div>
+  <div id="leg" style="height:10px;border-radius:3px"></div>
+  <div style="display:flex;justify-content:space-between;font-size:11px;opacity:.75;margin-bottom:4px"><span id="legMin">vor 1850</span><span id="legMax">heute</span></div>
   <div id="status">Warte auf GPS …</div>
   <div id="dbg"></div>
   Sichtfeld (horizontal): <span id="fovv">55</span>°
@@ -107,11 +107,16 @@ $('file').onchange = async e => {
   $('msg').textContent = feats.length + ' Gebäude aus Datei';
 };
 
-/* ===== Bauperioden & Farben (Viridis, ähnlich GIS-Browser) ===== */
+/* ===== Farbskala (Viridis, stufenlos nach Baujahr) ===== */
+// Eine stufenlose Skala statt fester Klassen: das Jahr wird linear zwischen MIN_YEAR und dem
+// aktuellen Jahr auf die Viridis-Palette abgebildet. So verteilen sich die Farben gleichmässiger
+// über den ganzen Zeitraum (ähnlich wie im offiziellen GIS-Browser des Kantons), statt dass
+// z. B. alles vor 1919 oder alles in der Mitte des 20. Jh. in derselben groben Klasse landet.
 const PERIODS = [[0,1849,'vor 1850'],[1850,1899,'1850–1899'],[1900,1918,'1900–1918'],[1919,1945,'1919–1945'],[1946,1960,'1946–1960'],[1961,1970,'1961–1970'],
   [1971,1980,'1971–1980'],[1981,1985,'1981–1985'],[1986,1990,'1986–1990'],[1991,1995,'1991–1995'],
   [1996,2000,'1996–2000'],[2001,2005,'2001–2005'],[2006,2010,'2006–2010'],[2011,2015,'2011–2015'],
   [2016,2020,'2016–2020'],[2021,9999,'ab 2021']];
+const MIN_YEAR = 1850, MAX_YEAR = new Date().getFullYear();
 const VIR = [[0,'#440154'],[.13,'#482878'],[.25,'#3e4989'],[.38,'#31688e'],[.5,'#26828e'],
   [.63,'#1f9e89'],[.75,'#35b779'],[.88,'#6ece58'],[.94,'#b5de2b'],[1,'#fde725']];
 function viridis(t){
@@ -120,8 +125,12 @@ function viridis(t){
   const a = [1,3,5].map(k => parseInt(c0.substr(k,2),16)), b = [1,3,5].map(k => parseInt(c1.substr(k,2),16));
   return 'rgb(' + a.map((v,k) => Math.round(v + (b[k]-v)*f)).join(',') + ')';
 }
-const COLORS = PERIODS.map((_,i) => viridis(i/(PERIODS.length-1)));
-$('leg').innerHTML = COLORS.map(c => `<div style="flex:1;background:${c}"></div>`).join('');
+function yearColor(year){
+  const t = Math.min(1, Math.max(0, (year - MIN_YEAR) / (MAX_YEAR - MIN_YEAR)));
+  return viridis(t);
+}
+$('leg').style.background = 'linear-gradient(90deg, ' + VIR.map(([t,c]) => `${c} ${t*100}%`).join(',') + ')';
+$('legMin').textContent = 'vor ' + MIN_YEAR; $('legMax').textContent = MAX_YEAR;
 
 /* ===== Attribute auslesen ===== */
 function findYearKey(props){
@@ -136,20 +145,18 @@ function ageInfo(props){
   const k = yearKey || (yearKey = findYearKey(props));
   const raw = k ? props[k] : null, s = String(raw ?? '');
   const ys = s.match(/\d{4}/g);
-  if(!ys) return { text: s !== '' ? s : 'Baujahr unbekannt', cls: -1, year: NaN };
+  if(!ys) return { text: s !== '' ? s : 'Baujahr unbekannt', year: NaN };
   const v = +ys[0];
   // GWR-Codes 8011–8024 stehen für feste Registerklassen (8011=vor 1919 ... 8024=ab 2021).
-  // Wir bilden sie auf ein typisches Jahr ab und lassen die normale Einordnung unten entscheiden,
-  // damit auch bei GWR-Codes die feineren Klassen vor 1919 (falls das echte Baujahr bekannt ist) greifen.
+  // Wir bilden sie auf ein typisches Jahr innerhalb der Klasse ab, damit die Farbe trotzdem
+  // stufenlos zum Rest der Skala passt.
   if(ys.length === 1 && v >= 8011 && v <= 8024){
     const GWR_YEAR = {8011:1900,8012:1932,8013:1953,8014:1966,8015:1976,8016:1983,8017:1988,
       8018:1993,8019:1998,8020:2003,8021:2008,8022:2013,8023:2018,8024:2022};
-    const y = GWR_YEAR[v];
-    return { text: 'Bauperiode (Register)', cls: PERIODS.findIndex(p => y >= p[0] && y <= p[1]), year: NaN };
+    return { text: 'Bauperiode (Register)', year: GWR_YEAR[v] };
   }
   const y = ys.map(Number), m = y.reduce((a,b) => a+b, 0)/y.length;
-  return { text: y.length > 1 ? `Bauperiode ${y[0]}–${y[1]}` : `Baujahr ${y[0]}`,
-           cls: PERIODS.findIndex(p => m >= p[0] && m <= p[1]), year: y.length > 1 ? NaN : y[0] };
+  return { text: y.length > 1 ? `Bauperiode ${y[0]}–${y[1]}` : `Baujahr ${y[0]}`, year: m };
 }
 
 /* ===== Geometrie ===== */
@@ -210,7 +217,7 @@ function draw(){
     ctx.lineWidth = 2*devicePixelRatio;
     for(const b of list){
       const isT = b === target, info = ageInfo(b.f.props);
-      const age = now - info.year, col = info.cls >= 0 ? COLORS[info.cls] : '#aaa';
+      const age = now - info.year, col = isNaN(info.year) ? '#aaa' : yearColor(info.year);
       const h = +b.f.props[CFG.fieldHeight] || CFG.defaultHeight;
       for(const ring of b.rs){
         const gr = ring.map(p => adjust(project(p.x,p.y,0))), rf = ring.map(p => adjust(project(p.x,p.y,h)));
