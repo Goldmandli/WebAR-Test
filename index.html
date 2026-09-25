@@ -211,7 +211,7 @@ function draw(){
           const q = [gr[i],gr[i+1],rf[i+1],rf[i]];
           if(q.some(v => !v)) continue;
           ctx.beginPath(); q.forEach((v,k) => k ? ctx.lineTo(v.x,v.y) : ctx.moveTo(v.x,v.y)); ctx.closePath();
-          ctx.globalAlpha = isT ? .85 : .7; ctx.fillStyle = col; ctx.fill();   // leicht transparent, Verdeckung bleibt durch Zeichenreihenfolge erhalten
+          ctx.globalAlpha = isT ? .7 : .5; ctx.fillStyle = col; ctx.fill();   // leicht transparent, Verdeckung bleibt durch Zeichenreihenfolge erhalten
           ctx.strokeStyle = isT ? '#fff' : col; ctx.lineWidth = (isT ? 3 : 1.5)*devicePixelRatio; ctx.stroke();
         }
       }
