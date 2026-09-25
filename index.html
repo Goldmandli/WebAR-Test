@@ -46,16 +46,27 @@ const CFG = {
   wfs: 'https://maps.zh.ch/wfs/OGDZHWFS',
   layer: 'ms:ogd-0415_stat_gebaeudealter_f',   // Gebäudealter (OGD), Kanton Zürich
   fieldYear: '',          // leer = automatisch erkennen (baujahr / bauperiode / alter …); sonst exakten Attributnamen eintragen
-  fieldHeight: '',        // optional: Attribut mit Gebäudehöhe
-  defaultHeight: 10,      // m
+  fieldHeight: '',        // optional: Attribut mit Gebäudehöhe (Fallback, falls kein 3D-Match)
+  defaultHeight: 10,      // m, letzter Rückfall ohne jede Höheninfo
   camHeight: 1.6,         // Augenhöhe in m
   radius: 150,            // Zeichenradius in m
   fetchRadius: 220,       // WFS-Abfrageradius in m
-  refetchDist: 60         // neu laden nach so vielen Metern Bewegung
+  refetchDist: 60,        // neu laden nach so vielen Metern Bewegung
+  // Echte 3D-Gebäudemodelle der Stadt Zürich (Dach-/Blockmodell). Nur innerhalb der Stadt verfügbar;
+  // ausserhalb greift automatisch der Rückfall (fieldHeight bzw. defaultHeight).
+  heights: {
+    url: 'https://www.ogd.stadt-zuerich.ch/wfs/geoportal/Bauten___Kombinierte_Darstellung_heute',
+    layer: 'kombi_lod1_2_heute_3d',
+    bbox: [8.4587, 47.3213, 8.6235, 47.4337],   // W,S,E,N (WGS84) – ungefähre Stadtgrenze laut WFS-Capabilities
+    matchBuffer: 4,        // m, Toleranz um den Grundriss beim Zuordnen der 3D-Punkte
+    minHeight: 2, maxHeight: 250   // Plausibilitätsgrenzen
+  }
 };
 
 /* ===== Zustand ===== */
-let feats = [], pos = null, lastFetch = null, busy = false, heading = 0, pitch = 0, hfov = 55, yearKey = null;
+let feats = [], pos = null, posWGS = null, lastFetch = null, lastHeightFetch = null, busy = false, heightsBusy = false;
+let heading = 0, pitch = 0, hfov = 55, yearKey = null;
+let heightFeats = [], heightsInCity = false, heightDbg = '';   // 3D-Höhenpunkte (lokale Koordinaten) der Stadt Zürich
 let userDX = 0, userDY = 0, userScale = 1;   // manuelle Verschiebung (px) / Skalierung, vom Nutzer per Touch gesetzt
 const $ = id => document.getElementById(id);
 const cv = $('c'), ctx = cv.getContext('2d');
@@ -106,6 +117,72 @@ $('file').onchange = async e => {
   feats = parseGeoJSON(gj, Math.abs(c) < 180); lastFetch = { e:1e9, n:1e9 }; yearKey = null;
   $('msg').textContent = feats.length + ' Gebäude aus Datei';
 };
+
+/* ===== Echte Gebäudehöhen (3D-Modell Stadt Zürich) =====
+   Der Dienst liefert Dach-/Wandflächen mit echten Höhenkoordinaten (Z), aber vermutlich in mehrere
+   Teile pro Gebäude zerlegt und nicht sicher mit unserem Grundriss-Layer über eine ID verknüpfbar.
+   Statt auf eine gemeinsame ID zu hoffen, sammeln wir alle 3D-Punkte lokal (in Metern relativ zum
+   Standort) und ordnen sie beim Zeichnen räumlich dem jeweiligen Grundriss zu (siehe buildingHeight). */
+function inCity(lat, lon){
+  const b = CFG.heights.bbox;
+  return lon >= b[0] && lon <= b[2] && lat >= b[1] && lat <= b[3];
+}
+function collectZ(coords, out){                  // Koordinaten-Array beliebiger Verschachtelung durchsuchen
+  if(typeof coords[0] === 'number'){ if(coords.length > 2) out.push(coords); return; }
+  for(const c of coords) collectZ(c, out);
+}
+async function fetchHeights(){
+  if(heightsBusy || !posWGS || !inCity(posWGS.lat, posWGS.lon)){ heightsInCity = inCity(posWGS?.lat, posWGS?.lon); return; }
+  heightsBusy = true; heightsInCity = true;
+  const r = CFG.fetchRadius;
+  const dLat = r/111320, dLon = r/(111320*Math.cos(posWGS.lat*rad));
+  const bbox = [posWGS.lon-dLon, posWGS.lat-dLat, posWGS.lon+dLon, posWGS.lat+dLat].join(',');
+  // WFS 1.0.0: BBOX ist eindeutig minx,miny,maxx,maxy = lon,lat,lon,lat (keine Achsreihenfolge-Unklarheit wie bei 1.1.0).
+  const url = `${CFG.heights.url}?SERVICE=WFS&VERSION=1.0.0&REQUEST=GetFeature&TYPENAME=${CFG.heights.layer}` +
+    `&OUTPUTFORMAT=${encodeURIComponent('application/vnd.geo+json')}&BBOX=${bbox}&MAXFEATURES=4000`;
+  try{
+    const res = await fetch(url); const gj = await res.json();
+    const pts = [];
+    for(const f of gj.features || []){
+      if(!f.geometry) continue;
+      const vs = []; collectZ(f.geometry.coordinates, vs);
+      if(!vs.length) continue;
+      for(const [lon,lat,z] of vs){
+        const c = wgs2lv95(lat, lon);
+        pts.push({ x: c.e-pos.e, y: c.n-pos.n, z });
+      }
+    }
+    heightFeats = pts; lastHeightFetch = { lat:posWGS.lat, lon:posWGS.lon };
+    heightDbg = pts.length + ' 3D-Punkte geladen';
+  }catch(e){
+    heightDbg = '3D-Höhen: Abfrage fehlgeschlagen (' + e.message + ') – Rückfall auf Standardhöhe';
+    heightFeats = [];
+  }
+  heightsBusy = false;
+}
+function pointInPoly(x, y, ring){                 // Standard Ray-Casting-Test
+  let inside = false;
+  for(let i=0, j=ring.length-1; i<ring.length; j=i++){
+    const xi=ring[i].x, yi=ring[i].y, xj=ring[j].x, yj=ring[j].y;
+    if(((yi>y)!==(yj>y)) && (x < (xj-xi)*(y-yi)/(yj-yi)+xi)) inside = !inside;
+  }
+  return inside;
+}
+function buildingHeight(b){
+  if(!heightFeats.length) return null;
+  const ring = b.rs[0], buf = CFG.heights.matchBuffer;
+  let minZ = Infinity, maxZ = -Infinity, n = 0;
+  for(const p of heightFeats){
+    let hit = pointInPoly(p.x, p.y, ring);
+    if(!hit){                                     // grobe Pufferzone: Distanz zum nächsten Eckpunkt
+      for(const c of ring){ if(Math.hypot(p.x-c.x, p.y-c.y) < buf){ hit = true; break; } }
+    }
+    if(hit){ minZ = Math.min(minZ, p.z); maxZ = Math.max(maxZ, p.z); n++; }
+  }
+  if(n < 3) return null;                          // zu wenige Treffer, unsicher
+  const h = maxZ - minZ;
+  return (h >= CFG.heights.minHeight && h <= CFG.heights.maxHeight) ? { h, n } : null;
+}
 
 /* ===== Farbskala (Viridis, stufenlos nach Baujahr) ===== */
 // Eine stufenlose Skala statt fester Klassen: das Jahr wird linear zwischen MIN_YEAR und dem
@@ -218,7 +295,8 @@ function draw(){
     for(const b of list){
       const isT = b === target, info = ageInfo(b.f.props);
       const age = now - info.year, col = isNaN(info.year) ? '#aaa' : yearColor(info.year);
-      const h = +b.f.props[CFG.fieldHeight] || CFG.defaultHeight;
+      const realH = buildingHeight(b);                                   // echte 3D-Höhe, falls Treffer in der Stadt
+      const h = realH ? realH.h : (+b.f.props[CFG.fieldHeight] || CFG.defaultHeight);
       for(const ring of b.rs){
         const gr = ring.map(p => adjust(project(p.x,p.y,0))), rf = ring.map(p => adjust(project(p.x,p.y,h)));
         for(let i=0;i<ring.length-1;i++){
@@ -236,7 +314,8 @@ function draw(){
         const w = ctx.measureText(txt).width + 24*devicePixelRatio;
         ctx.fillStyle = 'rgba(0,0,0,.75)'; ctx.fillRect(x-w/2, y-fs, w, fs*1.7);
         ctx.fillStyle = col; ctx.fillText(txt, x, y+fs*0.3);
-        $('dbg').textContent = JSON.stringify(b.f.props).slice(0,500);   // Attribute zum Prüfen
+        $('dbg').textContent = (realH ? `Höhe: ${realH.h.toFixed(1)} m (${realH.n} 3D-Punkte)` : `Höhe: Standard ${h} m`) +
+          ' · ' + heightDbg + ' · ' + JSON.stringify(b.f.props).slice(0,300);
       }
     }
     ctx.globalAlpha = 1;
@@ -273,10 +352,14 @@ async function start(){
     let acc = 0;
     navigator.geolocation.watchPosition(p => {
       const c = wgs2lv95(p.coords.latitude, p.coords.longitude); pos = c; acc = p.coords.accuracy;
+      posWGS = { lat:p.coords.latitude, lon:p.coords.longitude };
       if(!lastFetch || Math.hypot(c.e-lastFetch.e, c.n-lastFetch.n) > CFG.refetchDist) fetchData();
+      if(!lastHeightFetch || Math.hypot(posWGS.lat-lastHeightFetch.lat, posWGS.lon-lastHeightFetch.lon)*111320 > CFG.refetchDist)
+        fetchHeights();
     }, err => $('status').textContent = 'GPS-Fehler: ' + err.message, { enableHighAccuracy:true, maximumAge:1000 });
     setInterval(() => $('status').textContent = pos
-      ? `GPS ±${Math.round(acc)} m · Blick ${Math.round(heading)}° · ${feats.length} Gebäude` : 'Warte auf GPS …', 400);
+      ? `GPS ±${Math.round(acc)} m · Blick ${Math.round(heading)}° · ${feats.length} Gebäude · 3D-Höhen: ${heightsInCity ? 'an' : 'ausserhalb Stadt ZH'}`
+      : 'Warte auf GPS …', 400);
     $('start').style.display = 'none';
     draw();
   }catch(e){ $('msg').textContent = 'Fehler: ' + e.message + ' (HTTPS nötig!)'; }
