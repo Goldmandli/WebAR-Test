@@ -8,6 +8,7 @@
   html,body{margin:0;height:100%;background:#111;color:#fff;font:15px/1.4 system-ui,sans-serif;overflow:hidden}
   video,canvas{position:fixed;inset:0;width:100%;height:100%}
   video{object-fit:cover}
+  canvas{touch-action:none}
   #start{position:fixed;inset:0;display:flex;flex-direction:column;gap:14px;align-items:center;justify-content:center;background:#111;z-index:5;padding:24px;text-align:center}
   #start button,#start label{background:#f2c14e;color:#111;border:0;padding:14px 22px;border-radius:10px;font-size:16px;font-weight:600}
   #start small{opacity:.7;max-width:36ch}
@@ -33,6 +34,10 @@
   <div id="dbg"></div>
   Sichtfeld (horizontal): <span id="fovv">55</span>°
   <input id="fov" type="range" min="35" max="90" value="55">
+  <div style="display:flex;gap:8px;align-items:center;margin-top:6px">
+    <span style="flex:1;opacity:.8">Mit 1 Finger verschieben, mit 2 Fingern zoomen</span>
+    <button id="reset" style="background:#333;color:#fff;border:1px solid #666;border-radius:8px;padding:6px 10px">Zurücksetzen</button>
+  </div>
 </div>
 
 <script>
@@ -51,6 +56,7 @@ const CFG = {
 
 /* ===== Zustand ===== */
 let feats = [], pos = null, lastFetch = null, busy = false, heading = 0, pitch = 0, hfov = 55, yearKey = null;
+let userDX = 0, userDY = 0, userScale = 1;   // manuelle Verschiebung (px) / Skalierung, vom Nutzer per Touch gesetzt
 const $ = id => document.getElementById(id);
 const cv = $('c'), ctx = cv.getContext('2d');
 const rad = Math.PI/180, deg = 180/Math.PI;
@@ -163,12 +169,22 @@ function pickTarget(list){                       // Strahl in Blickrichtung → 
     }
   return best;
 }
+function r0Center(b){
+  const r0 = b.rs[0];
+  return { x: r0.reduce((s,p)=>s+p.x,0)/r0.length, y: r0.reduce((s,p)=>s+p.y,0)/r0.length };
+}
 function project(x, y, z){
   const az = Math.atan2(x, y)*deg, rel = ((az - heading + 540) % 360) - 180;
   if(Math.abs(rel) > 85) return null;
   const d = Math.hypot(x, y), el = Math.atan2(z - CFG.camHeight, d)*deg - pitch;
   const W = cv.width, H = cv.height, th = Math.tan(hfov/2*rad), tv = th*H/W;
   return { x: W/2 + Math.tan(rel*rad)/th*W/2, y: H/2 - Math.tan(el*rad)/tv*H/2 };
+}
+function adjust(p){                                     // manuelle Verschiebung/Skalierung des Nutzers einrechnen
+  if(!p) return p;
+  const cx = cv.width/2, cy = cv.height/2;
+  return { x: cx + (p.x-cx)*userScale + userDX*devicePixelRatio,
+           y: cy + (p.y-cy)*userScale + userDY*devicePixelRatio };
 }
 
 /* ===== Zeichnen ===== */
@@ -177,24 +193,30 @@ function draw(){
   ctx.clearRect(0,0,cv.width,cv.height);
   if(pos && feats.length){
     const list = nearby(), target = pickTarget(list), now = new Date().getFullYear();
+    // Von hinten nach vorne zeichnen (Malers-Algorithmus): nähere Gebäude übermalen weiter entfernte,
+    // dadurch bleiben nur die vordersten, sichtbaren Gebäude stehen.
+    for(const b of list){
+      const r0 = b.rs[0];
+      b._d = Math.min(...r0.map(p => Math.hypot(p.x,p.y)));
+    }
+    list.sort((a,b) => b._d - a._d);
     ctx.lineWidth = 2*devicePixelRatio;
     for(const b of list){
       const isT = b === target, info = ageInfo(b.f.props);
       const age = now - info.year, col = info.cls >= 0 ? COLORS[info.cls] : '#aaa';
       const h = +b.f.props[CFG.fieldHeight] || CFG.defaultHeight;
       for(const ring of b.rs){
-        const gr = ring.map(p => project(p.x,p.y,0)), rf = ring.map(p => project(p.x,p.y,h));
+        const gr = ring.map(p => adjust(project(p.x,p.y,0))), rf = ring.map(p => adjust(project(p.x,p.y,h)));
         for(let i=0;i<ring.length-1;i++){
           const q = [gr[i],gr[i+1],rf[i+1],rf[i]];
           if(q.some(v => !v)) continue;
           ctx.beginPath(); q.forEach((v,k) => k ? ctx.lineTo(v.x,v.y) : ctx.moveTo(v.x,v.y)); ctx.closePath();
-          ctx.globalAlpha = isT ? .55 : .35; ctx.fillStyle = col; ctx.fill();
-          ctx.globalAlpha = isT ? 1 : .6; ctx.strokeStyle = col; ctx.stroke();
+          ctx.globalAlpha = 1; ctx.fillStyle = col; ctx.fill();               // deckend, damit Verdecktes wirklich verschwindet
+          ctx.strokeStyle = isT ? '#fff' : col; ctx.lineWidth = (isT ? 3 : 1.5)*devicePixelRatio; ctx.stroke();
         }
       }
       if(isT){
-        const r0 = b.rs[0], cx = r0.reduce((s,p)=>s+p.x,0)/r0.length, cy = r0.reduce((s,p)=>s+p.y,0)/r0.length;
-        const s = project(cx, cy, h*0.6), txt = info.text + (isNaN(age) ? '' : ` (${Math.round(age)} J.)`);
+        const cx = r0Center(b), s = adjust(project(cx.x, cx.y, h*0.6)), txt = info.text + (isNaN(age) ? '' : ` (${Math.round(age)} J.)`);
         const fs = 20*devicePixelRatio, x = s ? s.x : cv.width/2, y = s ? s.y : cv.height/2;
         ctx.globalAlpha = 1; ctx.font = `700 ${fs}px system-ui`; ctx.textAlign = 'center';
         const w = ctx.measureText(txt).width + 24*devicePixelRatio;
@@ -247,6 +269,38 @@ async function start(){
 }
 $('go').onclick = start;
 $('fov').oninput = e => { hfov = +e.target.value; $('fovv').textContent = hfov; };
+$('reset').onclick = () => { userDX = 0; userDY = 0; userScale = 1; };
+
+/* ===== Touch: 1 Finger verschiebt, 2 Finger zoomen die Gebäude-Overlays ===== */
+const touches = new Map();
+let panBase = null, pinchBase = null;
+function pinchDist(){
+  const [a,b] = [...touches.values()];
+  return Math.hypot(a.x-b.x, a.y-b.y);
+}
+cv.addEventListener('pointerdown', e => {
+  cv.setPointerCapture(e.pointerId);
+  touches.set(e.pointerId, { x:e.clientX, y:e.clientY });
+  if(touches.size === 1) panBase = { x:e.clientX, y:e.clientY, dx:userDX, dy:userDY };
+  if(touches.size === 2) pinchBase = { dist: pinchDist(), scale: userScale };
+});
+cv.addEventListener('pointermove', e => {
+  if(!touches.has(e.pointerId)) return;
+  touches.set(e.pointerId, { x:e.clientX, y:e.clientY });
+  if(touches.size === 1 && panBase){
+    userDX = panBase.dx + (e.clientX - panBase.x);
+    userDY = panBase.dy + (e.clientY - panBase.y);
+  } else if(touches.size === 2 && pinchBase){
+    userScale = Math.min(6, Math.max(0.2, pinchBase.scale * (pinchDist() / pinchBase.dist)));
+  }
+});
+function endTouch(e){
+  touches.delete(e.pointerId);
+  if(touches.size === 1){ const [p] = [...touches.values()]; panBase = { x:p.x, y:p.y, dx:userDX, dy:userDY }; pinchBase = null; }
+  else if(touches.size === 0){ panBase = null; pinchBase = null; }
+}
+cv.addEventListener('pointerup', endTouch);
+cv.addEventListener('pointercancel', endTouch);
 </script>
 </body>
 </html>
