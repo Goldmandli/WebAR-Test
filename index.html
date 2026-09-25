@@ -108,7 +108,7 @@ $('file').onchange = async e => {
 };
 
 /* ===== Bauperioden & Farben (Viridis, ähnlich GIS-Browser) ===== */
-const PERIODS = [[0,1918,'vor 1919'],[1919,1945,'1919–1945'],[1946,1960,'1946–1960'],[1961,1970,'1961–1970'],
+const PERIODS = [[0,1849,'vor 1850'],[1850,1899,'1850–1899'],[1900,1918,'1900–1918'],[1919,1945,'1919–1945'],[1946,1960,'1946–1960'],[1961,1970,'1961–1970'],
   [1971,1980,'1971–1980'],[1981,1985,'1981–1985'],[1986,1990,'1986–1990'],[1991,1995,'1991–1995'],
   [1996,2000,'1996–2000'],[2001,2005,'2001–2005'],[2006,2010,'2006–2010'],[2011,2015,'2011–2015'],
   [2016,2020,'2016–2020'],[2021,9999,'ab 2021']];
@@ -138,8 +138,15 @@ function ageInfo(props){
   const ys = s.match(/\d{4}/g);
   if(!ys) return { text: s !== '' ? s : 'Baujahr unbekannt', cls: -1, year: NaN };
   const v = +ys[0];
-  if(ys.length === 1 && v >= 8011 && v < 8011 + PERIODS.length)      // GWR-Code der Bauperiode
-    return { text: 'Bauperiode ' + PERIODS[v-8011][2], cls: v-8011, year: NaN };
+  // GWR-Codes 8011–8024 stehen für feste Registerklassen (8011=vor 1919 ... 8024=ab 2021).
+  // Wir bilden sie auf ein typisches Jahr ab und lassen die normale Einordnung unten entscheiden,
+  // damit auch bei GWR-Codes die feineren Klassen vor 1919 (falls das echte Baujahr bekannt ist) greifen.
+  if(ys.length === 1 && v >= 8011 && v <= 8024){
+    const GWR_YEAR = {8011:1900,8012:1932,8013:1953,8014:1966,8015:1976,8016:1983,8017:1988,
+      8018:1993,8019:1998,8020:2003,8021:2008,8022:2013,8023:2018,8024:2022};
+    const y = GWR_YEAR[v];
+    return { text: 'Bauperiode (Register)', cls: PERIODS.findIndex(p => y >= p[0] && y <= p[1]), year: NaN };
+  }
   const y = ys.map(Number), m = y.reduce((a,b) => a+b, 0)/y.length;
   return { text: y.length > 1 ? `Bauperiode ${y[0]}–${y[1]}` : `Baujahr ${y[0]}`,
            cls: PERIODS.findIndex(p => m >= p[0] && m <= p[1]), year: y.length > 1 ? NaN : y[0] };
@@ -211,7 +218,7 @@ function draw(){
           const q = [gr[i],gr[i+1],rf[i+1],rf[i]];
           if(q.some(v => !v)) continue;
           ctx.beginPath(); q.forEach((v,k) => k ? ctx.lineTo(v.x,v.y) : ctx.moveTo(v.x,v.y)); ctx.closePath();
-          ctx.globalAlpha = isT ? .7 : .5; ctx.fillStyle = col; ctx.fill();   // leicht transparent, Verdeckung bleibt durch Zeichenreihenfolge erhalten
+          ctx.globalAlpha = isT ? .85 : .7; ctx.fillStyle = col; ctx.fill();   // leicht transparent, Verdeckung bleibt durch Zeichenreihenfolge erhalten
           ctx.strokeStyle = isT ? '#fff' : col; ctx.lineWidth = (isT ? 3 : 1.5)*devicePixelRatio; ctx.stroke();
         }
       }
