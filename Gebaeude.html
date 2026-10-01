@@ -25,7 +25,10 @@
   #photoSub{opacity:.7;font-size:13px}
   #photoLink{color:#f2c14e;text-decoration:underline;display:none;font-size:15px}
   #photoClose{position:absolute;top:calc(16px + env(safe-area-inset-top,0px));right:16px;background:#333;color:#fff;
-    border:1px solid #666;border-radius:50%;width:42px;height:42px;font-size:18px}
+    border:1px solid #666;border-radius:50%;width:42px;height:42px;font-size:18px}  #photoPrev,#photoNext{position:fixed;top:50%;transform:translateY(-50%);z-index:11;background:rgba(255,255,255,.15);
+    color:#fff;border:0;border-radius:50%;width:48px;height:48px;font-size:26px;display:none;align-items:center;justify-content:center}
+  #photoPrev{left:10px} #photoNext{right:10px}
+  #photoCount{opacity:.6;font-size:12px}
 </style>
 </head>
 <body>
@@ -41,10 +44,13 @@
 <button id="photoBtn">📷 Historisches Foto</button>
 <div id="photoModal">
   <button id="photoClose">✕</button>
+  <button id="photoPrev">‹</button>
+  <button id="photoNext">›</button>
   <img id="photoImg" alt="Historisches Foto">
   <a id="photoLink" target="_blank" rel="noopener">Foto in neuem Tab öffnen ↗</a>
   <div id="photoCap"></div>
   <div id="photoSub"></div>
+  <div id="photoCount"></div>
   <div id="photoRaw" style="opacity:.5;font-size:10px;word-break:break-all;max-width:90vw"></div>
 </div>
 <div id="hud">
@@ -89,7 +95,7 @@ const CFG = {
     layer: 'bilder_baz',
     fetchRadius: 150,      // m, Abfrageradius
     maxFeatures: 500,
-    matchRadius: 25        // m, wie weit ein Fotopunkt vom Gebäudemittelpunkt entfernt sein darf
+    matchRadius: 40        // m, wie weit ein Fotopunkt vom Gebäudemittelpunkt entfernt sein darf
   }
 };
 
@@ -98,7 +104,8 @@ let feats = [], pos = null, posWGS = null, lastFetch = null, lastHeightFetch = n
 let heading = 0, pitch = 0, hfov = 55, yearKey = null;
 let heightFeats = [], heightGrid = new Map(), heightsInCity = false, heightDbg = '';   // 3D-Höhenpunkte (lokale Koordinaten) der Stadt Zürich
 let photoFeats = [], photosBusy = false, lastPhotoFetch = null, photoDbg = '';
-let lastTargetFeat = null, currentPhoto = null;   // welches Gebäude zuletzt anvisiert war / passendes Foto dazu
+let currentPhotos = [], currentPhotoIdx = 0;
+let lastTargetFeat = null;   // welches Gebäude zuletzt anvisiert war
 let userDX = 0, userDY = 0, userScale = 1;   // manuelle Verschiebung (px) / Skalierung, vom Nutzer per Touch gesetzt
 const $ = id => document.getElementById(id);
 const cv = $('c'), ctx = cv.getContext('2d');
@@ -295,17 +302,17 @@ function findPhotoText(props, usedUrl){               // kurzer Beschreibungstex
   }
   return best;
 }
-function findNearbyPhoto(b){
-  if(!photoFeats.length) return null;
-  const c = r0Center(b);
-  let best = null, bestD = CFG.photos.matchRadius;
+function findNearbyPhotos(b){
+  if(!photoFeats.length) return [];
+  const c = r0Center(b), hits = [];
   for(const p of photoFeats){
     const d = Math.hypot(p.x-c.x, p.y-c.y);
-    if(d < bestD){ bestD = d; best = p; }
+    if(d >= CFG.photos.matchRadius) continue;
+    const url = findPhotoUrl(p.props); if(!url) continue;
+    hits.push({ url, year: findPhotoYear(p.props), text: findPhotoText(p.props, url), dist: d, props: p.props });
   }
-  if(!best) return null;
-  const url = findPhotoUrl(best.props); if(!url) return null;
-  return { url, year: findPhotoYear(best.props), text: findPhotoText(best.props, url), dist: bestD, props: best.props };
+  hits.sort((a,b) => a.dist-b.dist);
+  return hits;
 }
 
 /* ===== Farbskala (Viridis, stufenlos nach Baujahr) ===== */
@@ -448,9 +455,10 @@ function draw(){
   }
   if(targetFeat !== lastTargetFeat){               // Ziel hat gewechselt: Foto-Treffer neu suchen (günstig, nur hier)
     lastTargetFeat = targetFeat;
-    currentPhoto = targetFeat ? findNearbyPhoto({ rs:[localRings(targetFeat)[0]] }) : null;
-    $('photoBtn').style.display = currentPhoto ? 'block' : 'none';
-    if(currentPhoto) $('photoBtn').textContent = '📷 Historisches Foto' + (currentPhoto.year ? ` (${currentPhoto.year})` : '');
+    currentPhotos = targetFeat ? findNearbyPhotos({ rs:[localRings(targetFeat)[0]] }) : [];
+    currentPhotoIdx = 0;
+    $('photoBtn').style.display = currentPhotos.length ? 'block' : 'none';
+    if(currentPhotos.length) $('photoBtn').textContent = '📷 Historische Fotos' + (currentPhotos.length > 1 ? ` (${currentPhotos.length})` : '');
   }
   ctx.strokeStyle = '#fff'; ctx.lineWidth = 2;
   const m = [cv.width/2, cv.height/2]; ctx.beginPath();
@@ -533,22 +541,38 @@ function endTouch(e){
 cv.addEventListener('pointerup', endTouch);
 cv.addEventListener('pointercancel', endTouch);
 
-/* ===== Foto-Knopf & Modal ===== */
-$('photoBtn').onclick = () => {
-  if(!currentPhoto) return;
+/* ===== Foto-Knopf & Modal (mehrere Fotos durchblätterbar) ===== */
+function showPhoto(i){
+  if(!currentPhotos.length) return;
+  currentPhotoIdx = (i + currentPhotos.length) % currentPhotos.length;
+  const p = currentPhotos[currentPhotoIdx];
   $('photoImg').style.display = 'block'; $('photoLink').style.display = 'none';
-  $('photoImg').src = currentPhoto.url;
-  $('photoCap').textContent = currentPhoto.year ? `Aufnahme aus dem Jahr ${currentPhoto.year}` : 'Aufnahmejahr unbekannt';
-  $('photoSub').textContent = currentPhoto.text || '';
-  $('photoRaw').textContent = JSON.stringify(currentPhoto.props).slice(0,400);
+  $('photoImg').src = p.url;
+  $('photoCap').textContent = p.year ? `Aufnahme aus dem Jahr ${p.year}` : 'Aufnahmejahr unbekannt';
+  $('photoSub').textContent = p.text || '';
+  $('photoRaw').textContent = JSON.stringify(p.props).slice(0,400);
+  $('photoCount').textContent = currentPhotos.length > 1 ? `${currentPhotoIdx+1} / ${currentPhotos.length}` : '';
+  $('photoPrev').style.display = currentPhotos.length > 1 ? 'flex' : 'none';
+  $('photoNext').style.display = currentPhotos.length > 1 ? 'flex' : 'none';
   $('photoModal').style.display = 'flex';
-};
+}
+$('photoBtn').onclick = () => showPhoto(0);
+$('photoPrev').onclick = () => showPhoto(currentPhotoIdx - 1);
+$('photoNext').onclick = () => showPhoto(currentPhotoIdx + 1);
 $('photoImg').onerror = () => {                    // falls die URL kein direktes Bild ist, als Link anbieten
   $('photoImg').style.display = 'none';
   $('photoLink').style.display = 'inline';
-  $('photoLink').href = currentPhoto ? currentPhoto.url : '#';
+  $('photoLink').href = currentPhotos[currentPhotoIdx] ? currentPhotos[currentPhotoIdx].url : '#';
 };
 $('photoClose').onclick = () => { $('photoModal').style.display = 'none'; };
+
+let swipeStartX = null;
+$('photoModal').addEventListener('pointerdown', e => { swipeStartX = e.clientX; });
+$('photoModal').addEventListener('pointerup', e => {
+  if(swipeStartX == null) return;
+  const dx = e.clientX - swipeStartX; swipeStartX = null;
+  if(Math.abs(dx) > 50) showPhoto(currentPhotoIdx + (dx < 0 ? 1 : -1));
+});
 </script>
 </body>
 </html>
