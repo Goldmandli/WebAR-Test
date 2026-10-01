@@ -58,6 +58,8 @@ const CFG = {
     url: 'https://www.ogd.stadt-zuerich.ch/wfs/geoportal/Bauten___Kombinierte_Darstellung_heute',
     layer: 'kombi_lod1_2_heute_3d',
     bbox: [8.4587, 47.3213, 8.6235, 47.4337],   // W,S,E,N (WGS84) – ungefähre Stadtgrenze laut WFS-Capabilities
+    fetchRadius: 90,       // m – bewusst kleiner als der Grundriss-Radius, sonst zu viel Datenvolumen/zu langsam
+    maxFeatures: 800,      // Obergrenze pro Abfrage, ebenfalls zur Geschwindigkeit
     matchBuffer: 4,        // m, Toleranz um den Grundriss beim Zuordnen der 3D-Punkte
     minHeight: 2, maxHeight: 250   // Plausibilitätsgrenzen
   }
@@ -66,7 +68,7 @@ const CFG = {
 /* ===== Zustand ===== */
 let feats = [], pos = null, posWGS = null, lastFetch = null, lastHeightFetch = null, busy = false, heightsBusy = false;
 let heading = 0, pitch = 0, hfov = 55, yearKey = null;
-let heightFeats = [], heightsInCity = false, heightDbg = '';   // 3D-Höhenpunkte (lokale Koordinaten) der Stadt Zürich
+let heightFeats = [], heightGrid = new Map(), heightsInCity = false, heightDbg = '';   // 3D-Höhenpunkte (lokale Koordinaten) der Stadt Zürich
 let userDX = 0, userDY = 0, userScale = 1;   // manuelle Verschiebung (px) / Skalierung, vom Nutzer per Touch gesetzt
 const $ = id => document.getElementById(id);
 const cv = $('c'), ctx = cv.getContext('2d');
@@ -104,7 +106,7 @@ async function fetchData(){
   try{
     const res = await fetch(url); const gj = await res.json();
     feats = parseGeoJSON(gj, false); lastFetch = { e:pos.e, n:pos.n };
-    yearKey = null;
+    yearKey = null; assignHeights();
     $('msg').textContent = feats.length + ' Gebäude geladen';
   }catch(e){
     $('dbg').textContent = 'WFS-Abfrage fehlgeschlagen (' + e.message + ') – ggf. CORS. Alternative: GeoJSON-Datei wählen.';
@@ -133,14 +135,15 @@ function collectZ(coords, out){                  // Koordinaten-Array beliebiger
 }
 async function fetchHeights(){
   if(heightsBusy || !posWGS || !inCity(posWGS.lat, posWGS.lon)){ heightsInCity = inCity(posWGS?.lat, posWGS?.lon); return; }
-  heightsBusy = true; heightsInCity = true;
-  const r = CFG.fetchRadius;
+  heightsBusy = true; heightsInCity = true; heightDbg = '3D-Höhen: lädt …';
+  const r = CFG.heights.fetchRadius;             // bewusst kleiner als der Grundriss-Radius, sonst zu viele Daten
   const dLat = r/111320, dLon = r/(111320*Math.cos(posWGS.lat*rad));
   const bbox = [posWGS.lon-dLon, posWGS.lat-dLat, posWGS.lon+dLon, posWGS.lat+dLat].join(',');
   // WFS 1.0.0: BBOX ist eindeutig minx,miny,maxx,maxy = lon,lat,lon,lat (keine Achsreihenfolge-Unklarheit wie bei 1.1.0).
   const url = `${CFG.heights.url}?SERVICE=WFS&VERSION=1.0.0&REQUEST=GetFeature&TYPENAME=${CFG.heights.layer}` +
-    `&OUTPUTFORMAT=${encodeURIComponent('application/vnd.geo+json')}&BBOX=${bbox}&MAXFEATURES=4000`;
+    `&OUTPUTFORMAT=${encodeURIComponent('application/vnd.geo+json')}&BBOX=${bbox}&MAXFEATURES=${CFG.heights.maxFeatures}`;
   try{
+    const t0 = performance.now();
     const res = await fetch(url); const gj = await res.json();
     const pts = [];
     for(const f of gj.features || []){
@@ -153,12 +156,33 @@ async function fetchHeights(){
       }
     }
     heightFeats = pts; lastHeightFetch = { lat:posWGS.lat, lon:posWGS.lon };
-    heightDbg = pts.length + ' 3D-Punkte geladen';
+    heightGrid = buildGrid(pts);
+    assignHeights();                              // einmalig berechnen & auf den Gebäuden cachen, nicht pro Frame
+    heightDbg = `${pts.length} 3D-Punkte · ${Math.round(performance.now()-t0)} ms`;
   }catch(e){
     heightDbg = '3D-Höhen: Abfrage fehlgeschlagen (' + e.message + ') – Rückfall auf Standardhöhe';
-    heightFeats = [];
+    heightFeats = []; heightGrid = new Map();
   }
   heightsBusy = false;
+}
+
+/* Gitter-Index (10 m Zellen) für die 3D-Punkte, damit wir pro Gebäude nicht alle Punkte durchsuchen müssen */
+const GRID = 10;
+const cellKey = (x,y) => Math.floor(x/GRID) + ',' + Math.floor(y/GRID);
+function buildGrid(pts){
+  const g = new Map();
+  for(const p of pts){ const k = cellKey(p.x,p.y); (g.get(k) || g.set(k,[]).get(k)).push(p); }
+  return g;
+}
+function candidatesFor(ring, buf){
+  let minX=Infinity,maxX=-Infinity,minY=Infinity,maxY=-Infinity;
+  for(const c of ring){ minX=Math.min(minX,c.x); maxX=Math.max(maxX,c.x); minY=Math.min(minY,c.y); maxY=Math.max(maxY,c.y); }
+  const out = [];
+  for(let gx=Math.floor((minX-buf)/GRID); gx<=Math.floor((maxX+buf)/GRID); gx++)
+    for(let gy=Math.floor((minY-buf)/GRID); gy<=Math.floor((maxY+buf)/GRID); gy++){
+      const c = heightGrid.get(gx+','+gy); if(c) out.push(...c);
+    }
+  return out;
 }
 function pointInPoly(x, y, ring){                 // Standard Ray-Casting-Test
   let inside = false;
@@ -168,20 +192,23 @@ function pointInPoly(x, y, ring){                 // Standard Ray-Casting-Test
   }
   return inside;
 }
-function buildingHeight(b){
-  if(!heightFeats.length) return null;
-  const ring = b.rs[0], buf = CFG.heights.matchBuffer;
+function computeHeight(ring){
+  const buf = CFG.heights.matchBuffer, cand = candidatesFor(ring, buf);
   let minZ = Infinity, maxZ = -Infinity, n = 0;
-  for(const p of heightFeats){
+  for(const p of cand){
     let hit = pointInPoly(p.x, p.y, ring);
-    if(!hit){                                     // grobe Pufferzone: Distanz zum nächsten Eckpunkt
-      for(const c of ring){ if(Math.hypot(p.x-c.x, p.y-c.y) < buf){ hit = true; break; } }
-    }
+    if(!hit){ for(const c of ring){ if(Math.hypot(p.x-c.x, p.y-c.y) < buf){ hit = true; break; } } }
     if(hit){ minZ = Math.min(minZ, p.z); maxZ = Math.max(maxZ, p.z); n++; }
   }
-  if(n < 3) return null;                          // zu wenige Treffer, unsicher
+  if(n < 3) return null;
   const h = maxZ - minZ;
   return (h >= CFG.heights.minHeight && h <= CFG.heights.maxHeight) ? { h, n } : null;
+}
+// Berechnet die Höhe einmal für jedes aktuell geladene Gebäude und speichert sie direkt am Objekt (Cache),
+// statt sie bei jedem einzelnen Bildschirm-Frame neu auszurechnen – das war die Hauptursache der Langsamkeit.
+function assignHeights(){
+  if(!pos || !heightFeats.length) return;
+  for(const f of feats) f._h3d = computeHeight(localRings(f)[0]);
 }
 
 /* ===== Farbskala (Viridis, stufenlos nach Baujahr) ===== */
@@ -295,7 +322,7 @@ function draw(){
     for(const b of list){
       const isT = b === target, info = ageInfo(b.f.props);
       const age = now - info.year, col = isNaN(info.year) ? '#aaa' : yearColor(info.year);
-      const realH = buildingHeight(b);                                   // echte 3D-Höhe, falls Treffer in der Stadt
+      const realH = b.f._h3d || null;                                    // gecachte 3D-Höhe (einmal pro Abruf berechnet)
       const h = realH ? realH.h : (+b.f.props[CFG.fieldHeight] || CFG.defaultHeight);
       for(const ring of b.rs){
         const gr = ring.map(p => adjust(project(p.x,p.y,0))), rf = ring.map(p => adjust(project(p.x,p.y,h)));
@@ -358,7 +385,7 @@ async function start(){
         fetchHeights();
     }, err => $('status').textContent = 'GPS-Fehler: ' + err.message, { enableHighAccuracy:true, maximumAge:1000 });
     setInterval(() => $('status').textContent = pos
-      ? `GPS ±${Math.round(acc)} m · Blick ${Math.round(heading)}° · ${feats.length} Gebäude · 3D-Höhen: ${heightsInCity ? 'an' : 'ausserhalb Stadt ZH'}`
+      ? `GPS ±${Math.round(acc)} m · Blick ${Math.round(heading)}° · ${feats.length} Gebäude · ${heightsInCity ? heightDbg : '3D-Höhen: ausserhalb Stadt ZH'}`
       : 'Warte auf GPS …', 400);
     $('start').style.display = 'none';
     draw();
