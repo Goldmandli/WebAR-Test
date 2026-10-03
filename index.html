@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>Gebäudealter AR – Kanton Zürich</title>
+<title>Gebäudealter AR – mit Adresse</title>
 <style>
   html,body{margin:0;height:100%;background:#111;color:#fff;font:15px/1.4 system-ui,sans-serif;overflow:hidden}
   video,canvas{position:fixed;inset:0;width:100%;height:100%}
@@ -15,18 +15,34 @@
   #hud{position:fixed;left:0;right:0;bottom:0;padding:10px 14px calc(10px + env(safe-area-inset-bottom,0px));background:rgba(0,0,0,.55);z-index:4;font-size:13px}
   #hud input{width:100%}
   #dbg{opacity:.7;font-size:11px;word-break:break-all}
+  #plaqueBtn{position:fixed;width:34px;height:34px;border-radius:50%;background:#2b6fde;color:#fff;
+    border:2px solid #fff;font-weight:800;font-size:16px;display:none;align-items:center;justify-content:center;
+    z-index:6;box-shadow:0 2px 6px rgba(0,0,0,.5);transform:translate(-50%,-50%)}
+  #plaqueModal{position:fixed;inset:0;z-index:10;background:rgba(0,0,0,.92);display:none;flex-direction:column;
+    align-items:center;justify-content:center;padding:28px;gap:10px;text-align:center}
+  #plaqueModal h3{margin:0;font-size:18px}
+  #plaqueModal p{margin:0;font-size:15px;line-height:1.5;max-width:60ch;white-space:pre-wrap}
+  #plaqueClose{position:absolute;top:calc(16px + env(safe-area-inset-top,0px));right:16px;background:#333;color:#fff;
+    border:1px solid #666;border-radius:50%;width:42px;height:42px;font-size:18px}
 </style>
 </head>
 <body>
 <div id="start">
   <h2 style="margin:0">Gebäudealter AR</h2>
-  <small>Kamera, Standort und Kompass werden benötigt. Halte das Handy aufrecht und ziele auf ein Haus. Daten: Gebäudealter (OGD), Kanton Zürich.</small>
+  <small>Kamera, Standort und Kompass werden benötigt. Halte das Handy aufrecht und ziele auf ein Haus. Daten: Gebäudealter (OGD) Kanton Zürich, Adresse (GWR) swisstopo, blaue Tafeln Stadt Zürich.</small>
   <button id="go">Starten</button>
   <label>Eigene GeoJSON-Datei (Notlösung)<input id="file" type="file" accept=".geojson,.json" hidden></label>
   <small id="msg"></small>
 </div>
 <video id="v" playsinline muted></video>
 <canvas id="c"></canvas>
+<button id="plaqueBtn">i</button>
+<div id="plaqueModal">
+  <button id="plaqueClose">✕</button>
+  <h3 id="plaqueTitle">Blaue Tafel</h3>
+  <p id="plaqueText"></p>
+  <div id="plaqueRaw" style="opacity:.5;font-size:10px;word-break:break-all;max-width:90vw"></div>
+</div>
 <div id="hud">
   <div id="leg" style="height:10px;border-radius:3px"></div>
   <div style="display:flex;justify-content:space-between;font-size:11px;opacity:.75;margin-bottom:4px"><span id="legMin">vor 1850</span><span id="legMax">heute</span></div>
@@ -62,6 +78,19 @@ const CFG = {
     maxFeatures: 800,      // Obergrenze pro Abfrage, ebenfalls zur Geschwindigkeit
     matchBuffer: 4,        // m, Toleranz um den Grundriss beim Zuordnen der 3D-Punkte
     minHeight: 2, maxHeight: 250   // Plausibilitätsgrenzen
+  },
+  // Adress-Nachschlagedienst von swisstopo (öffentlich, kein API-Schlüssel nötig).
+  address: {
+    url: 'https://api3.geo.admin.ch/rest/services/api/MapServer/identify',
+    tolerance: 20           // m, Umkreis um den Gebäudemittelpunkt für die Adresssuche
+  },
+  // Blaue Informationstafeln an Denkmalschutz-Objekten, Stadt Zürich. Punkt-Layer.
+  plaques: {
+    url: 'https://www.ogd.stadt-zuerich.ch/wfs/geoportal/Liste_der_Informationstafeln_an_Denkmalschutz_Objekten',
+    layer: 'blaue_tafeln_p',
+    fetchRadius: 150,       // m, Abfrageradius
+    maxFeatures: 500,
+    matchRadius: 25         // m, wie weit eine Tafel vom Gebäuderand entfernt sein darf
   }
 };
 
@@ -69,6 +98,9 @@ const CFG = {
 let feats = [], pos = null, posWGS = null, lastFetch = null, lastHeightFetch = null, busy = false, heightsBusy = false;
 let heading = 0, pitch = 0, hfov = 55, yearKey = null;
 let heightFeats = [], heightGrid = new Map(), heightsInCity = false, heightDbg = '';   // 3D-Höhenpunkte (lokale Koordinaten) der Stadt Zürich
+let plaqueFeats = [], plaqueGrid = new Map(), plaquesBusy = false, lastPlaqueFetch = null, plaqueDbg = '';
+let plaqueShown = null;   // welches Tafel-Objekt gerade im blauen Button steckt (für den Klick-Handler)
+
 let userDX = 0, userDY = 0, userScale = 1;   // manuelle Verschiebung (px) / Skalierung, vom Nutzer per Touch gesetzt
 const $ = id => document.getElementById(id);
 const cv = $('c'), ctx = cv.getContext('2d');
@@ -106,7 +138,7 @@ async function fetchData(){
   try{
     const res = await fetch(url); const gj = await res.json();
     feats = parseGeoJSON(gj, false); lastFetch = { e:pos.e, n:pos.n };
-    yearKey = null; assignHeights();
+    yearKey = null; assignHeights(); assignPlaques();
     $('msg').textContent = feats.length + ' Gebäude geladen';
   }catch(e){
     $('dbg').textContent = 'WFS-Abfrage fehlgeschlagen (' + e.message + ') – ggf. CORS. Alternative: GeoJSON-Datei wählen.';
@@ -174,13 +206,13 @@ function buildGrid(pts){
   for(const p of pts){ const k = cellKey(p.x,p.y); (g.get(k) || g.set(k,[]).get(k)).push(p); }
   return g;
 }
-function candidatesFor(ring, buf){
+function candidatesFor(ring, buf, grid){
   let minX=Infinity,maxX=-Infinity,minY=Infinity,maxY=-Infinity;
   for(const c of ring){ minX=Math.min(minX,c.x); maxX=Math.max(maxX,c.x); minY=Math.min(minY,c.y); maxY=Math.max(maxY,c.y); }
   const out = [];
   for(let gx=Math.floor((minX-buf)/GRID); gx<=Math.floor((maxX+buf)/GRID); gx++)
     for(let gy=Math.floor((minY-buf)/GRID); gy<=Math.floor((maxY+buf)/GRID); gy++){
-      const c = heightGrid.get(gx+','+gy); if(c) out.push(...c);
+      const c = grid.get(gx+','+gy); if(c) out.push(...c);
     }
   return out;
 }
@@ -192,8 +224,20 @@ function pointInPoly(x, y, ring){                 // Standard Ray-Casting-Test
   }
   return inside;
 }
+function distToSeg(px,py, x1,y1, x2,y2){          // kürzeste Distanz Punkt → Strecke
+  const dx=x2-x1, dy=y2-y1, len2=dx*dx+dy*dy;
+  let t = len2 ? ((px-x1)*dx+(py-y1)*dy)/len2 : 0;
+  t = Math.max(0, Math.min(1, t));
+  return Math.hypot(px-(x1+t*dx), py-(y1+t*dy));
+}
+function distToRing(x, y, ring){                  // 0, falls Punkt innerhalb; sonst Abstand zum nächsten Rand
+  if(pointInPoly(x, y, ring)) return 0;
+  let d = Infinity;
+  for(let i=0, j=ring.length-1; i<ring.length; j=i++) d = Math.min(d, distToSeg(x,y, ring[j].x,ring[j].y, ring[i].x,ring[i].y));
+  return d;
+}
 function computeHeight(ring){
-  const buf = CFG.heights.matchBuffer, cand = candidatesFor(ring, buf);
+  const buf = CFG.heights.matchBuffer, cand = candidatesFor(ring, buf, heightGrid);
   let minZ = Infinity, maxZ = -Infinity, n = 0;
   for(const p of cand){
     let hit = pointInPoly(p.x, p.y, ring);
@@ -209,6 +253,81 @@ function computeHeight(ring){
 function assignHeights(){
   if(!pos || !heightFeats.length) return;
   for(const f of feats) f._h3d = computeHeight(localRings(f)[0]);
+}
+
+/* ===== Adresse (swisstopo, Gebäude- und Wohnungsregister) =====
+   Öffentlicher Dienst von swisstopo, kein API-Schlüssel nötig. Liefert zu einer Koordinate die
+   nächstgelegene Adresse aus dem eidgenössischen Gebäude- und Wohnungsregister (GWR). */
+async function fetchAddress(f){
+  if(f._addrBusy || f._addr !== undefined) return;    // schon unterwegs oder schon erledigt (auch bei "kein Ergebnis")
+  f._addrBusy = true;
+  const c = r0Center({ rs:[localRings(f)[0]] });
+  const e = pos.e + c.x, n = pos.n + c.y;
+  const url = `${CFG.address.url}?geometryType=esriGeometryPoint&geometry=${e},${n}&sr=2056` +
+    `&layers=all:ch.bfs.gebaeude_wohnungs_register&mapExtent=0,0,100,100&imageDisplay=100,100,100` +
+    `&tolerance=${CFG.address.tolerance}&geometryFormat=geojson&lang=de`;
+  try{
+    const res = await fetch(url); const gj = await res.json();
+    const a = gj.results && gj.results[0] && gj.results[0].attributes;
+    if(a){
+      const street = a.strname_deinr || [a.strname1, a.deinr].filter(Boolean).join(' ');
+      const city = [a.plz4, a.plzname].filter(Boolean).join(' ');
+      f._addr = [street, city].filter(Boolean).join(', ') || a.label || null;
+    } else f._addr = null;
+  }catch(e){
+    f._addr = null;
+  }
+  f._addrBusy = false;
+}
+
+/* ===== Blaue Informationstafeln (Denkmalschutz, Stadt Zürich) =====
+   Punkt-Layer, analog zu den 3D-Höhen abgefragt und über das Gitter räumlich den Gebäuden zugeordnet.
+   Die genauen Feldnamen kennen wir nicht sicher, deshalb generische Suche nach Text-/Titel-Feldern. */
+async function fetchPlaques(){
+  if(plaquesBusy || !posWGS) return; plaquesBusy = true; plaqueDbg = 'Tafeln: lädt …';
+  const r = CFG.plaques.fetchRadius;
+  const dLat = r/111320, dLon = r/(111320*Math.cos(posWGS.lat*rad));
+  const bbox = [posWGS.lon-dLon, posWGS.lat-dLat, posWGS.lon+dLon, posWGS.lat+dLat].join(',');
+  const url = `${CFG.plaques.url}?SERVICE=WFS&VERSION=1.0.0&REQUEST=GetFeature&TYPENAME=${CFG.plaques.layer}` +
+    `&OUTPUTFORMAT=${encodeURIComponent('application/vnd.geo+json')}&BBOX=${bbox}&MAXFEATURES=${CFG.plaques.maxFeatures}`;
+  try{
+    const t0 = performance.now();
+    const res = await fetch(url); const gj = await res.json();
+    const pts = [];
+    for(const f of gj.features || []){
+      const g = f.geometry; if(!g || g.type !== 'Point') continue;
+      const [lon,lat] = g.coordinates, c = wgs2lv95(lat,lon);
+      pts.push({ x: c.e-pos.e, y: c.n-pos.n, props: f.properties || {} });
+    }
+    plaqueFeats = pts; lastPlaqueFetch = { lat:posWGS.lat, lon:posWGS.lon };
+    plaqueGrid = buildGrid(pts);
+    assignPlaques();
+    plaqueDbg = `${pts.length} Tafelpunkte · ${Math.round(performance.now()-t0)} ms`;
+  }catch(e){
+    plaqueDbg = 'Tafeln: Abfrage fehlgeschlagen (' + e.message + ')';
+    plaqueFeats = []; plaqueGrid = new Map();
+  }
+  plaquesBusy = false;
+}
+// Echte Feldnamen (aus einer Informationsabfrage im GIS-Browser bestätigt): titel_tafel, text_tafel,
+// av_adresse. "montiert" wird bewusst nicht gefiltert – jede Tafel mit Text zählt als Treffer.
+function plaqueInfo(props){
+  const title = String(props.titel_tafel ?? '').trim();
+  const text = String(props.text_tafel ?? '').trim();
+  const address = String(props.av_adresse ?? '').trim();
+  return { title, text, address, props };
+}
+function assignPlaques(){
+  if(!pos || !plaqueFeats.length) return;
+  for(const f of feats){
+    const ring = localRings(f)[0], cand = candidatesFor(ring, CFG.plaques.matchRadius, plaqueGrid);
+    let best = null, bestD = CFG.plaques.matchRadius;
+    for(const p of cand){
+      const d = distToRing(p.x, p.y, ring);
+      if(d < bestD){ bestD = d; best = p; }
+    }
+    f._plaque = (best && plaqueInfo(best.props).text) ? { ...plaqueInfo(best.props), dist: bestD } : null;
+  }
 }
 
 /* ===== Farbskala (Viridis, stufenlos nach Baujahr) ===== */
@@ -275,18 +394,6 @@ function nearby(){
   }
   return out;
 }
-function pickTarget(list){                       // Strahl in Blickrichtung → erstes Gebäude
-  const dx = Math.sin(heading*rad), dy = Math.cos(heading*rad);
-  let best = null, bestT = Infinity;
-  for(const b of list) for(const ring of b.rs)
-    for(let i=0;i<ring.length-1;i++){
-      const p = ring[i], q = ring[i+1], ex = q.x-p.x, ey = q.y-p.y, den = dx*ey - dy*ex;
-      if(Math.abs(den) < 1e-9) continue;
-      const t = (p.x*ey - p.y*ex)/den, u = (p.x*dy - p.y*dx)/den;
-      if(t > 0 && u >= 0 && u <= 1 && t < bestT){ bestT = t; best = b; }
-    }
-  return best;
-}
 function r0Center(b){
   const r0 = b.rs[0];
   return { x: r0.reduce((s,p)=>s+p.x,0)/r0.length, y: r0.reduce((s,p)=>s+p.y,0)/r0.length };
@@ -309,8 +416,13 @@ function adjust(p){                                     // manuelle Verschiebung
 function draw(){
   cv.width = innerWidth*devicePixelRatio; cv.height = innerHeight*devicePixelRatio;
   ctx.clearRect(0,0,cv.width,cv.height);
+  let plaqueVisible = false;
   if(pos && feats.length){
-    const list = nearby(), target = pickTarget(list), now = new Date().getFullYear();
+    const list = nearby(), now = new Date().getFullYear();
+    for(const b of list){
+      const realH = b.f._h3d || null;                                    // gecachte 3D-Höhe (einmal pro Abruf berechnet)
+      b._realH = realH; b._h = realH ? realH.h : (+b.f.props[CFG.fieldHeight] || CFG.defaultHeight);
+    }
     // Von hinten nach vorne zeichnen (Malers-Algorithmus): nähere Gebäude übermalen weiter entfernte,
     // dadurch bleiben nur die vordersten, sichtbaren Gebäude stehen.
     for(const b of list){
@@ -318,35 +430,68 @@ function draw(){
       b._d = Math.min(...r0.map(p => Math.hypot(p.x,p.y)));
     }
     list.sort((a,b) => b._d - a._d);
-    ctx.lineWidth = 2*devicePixelRatio;
+
+    // Bildschirm-Quads einmal berechnen (inkl. manueller Verschiebung/Zoom) – werden fürs Zeichnen
+    // UND für die Fadenkreuz-Erkennung gebraucht, damit beides exakt zusammenpasst.
     for(const b of list){
-      const isT = b === target, info = ageInfo(b.f.props);
-      const age = now - info.year, col = isNaN(info.year) ? '#aaa' : yearColor(info.year);
-      const realH = b.f._h3d || null;                                    // gecachte 3D-Höhe (einmal pro Abruf berechnet)
-      const h = realH ? realH.h : (+b.f.props[CFG.fieldHeight] || CFG.defaultHeight);
+      const quads = [];
       for(const ring of b.rs){
-        const gr = ring.map(p => adjust(project(p.x,p.y,0))), rf = ring.map(p => adjust(project(p.x,p.y,h)));
+        const gr = ring.map(p => adjust(project(p.x,p.y,0))), rf = ring.map(p => adjust(project(p.x,p.y,b._h)));
         for(let i=0;i<ring.length-1;i++){
           const q = [gr[i],gr[i+1],rf[i+1],rf[i]];
-          if(q.some(v => !v)) continue;
-          ctx.beginPath(); q.forEach((v,k) => k ? ctx.lineTo(v.x,v.y) : ctx.moveTo(v.x,v.y)); ctx.closePath();
-          ctx.globalAlpha = isT ? .85 : .7; ctx.fillStyle = col; ctx.fill();   // leicht transparent, Verdeckung bleibt durch Zeichenreihenfolge erhalten
-          ctx.strokeStyle = isT ? '#fff' : col; ctx.lineWidth = (isT ? 3 : 1.5)*devicePixelRatio; ctx.stroke();
+          if(!q.some(v => !v)) quads.push(q);
         }
       }
+      b._quads = quads;
+    }
+
+    // Fadenkreuz-Treffer in Bildschirmkoordinaten, von vorne (nah) nach hinten geprüft – das entspricht
+    // genau dem, was optisch zuoberst liegt, und berücksichtigt automatisch Verschiebung/Zoom.
+    const cxS = cv.width/2, cyS = cv.height/2;
+    let target = null;
+    for(let i = list.length-1; i >= 0 && !target; i--){
+      if(list[i]._quads.some(q => pointInPoly(cxS, cyS, q))) target = list[i];
+    }
+
+    ctx.lineWidth = 2*devicePixelRatio;
+    for(const b of list){
+      const isT = b === target, info = ageInfo(b.f.props), h = b._h, realH = b._realH;
+      const age = now - info.year, col = isNaN(info.year) ? '#aaa' : yearColor(info.year);
+      for(const q of b._quads){
+        ctx.beginPath(); q.forEach((v,k) => k ? ctx.lineTo(v.x,v.y) : ctx.moveTo(v.x,v.y)); ctx.closePath();
+        ctx.globalAlpha = isT ? .85 : .7; ctx.fillStyle = col; ctx.fill();   // leicht transparent, Verdeckung bleibt durch Zeichenreihenfolge erhalten
+        ctx.strokeStyle = isT ? '#fff' : col; ctx.lineWidth = (isT ? 3 : 1.5)*devicePixelRatio; ctx.stroke();
+      }
       if(isT){
+        if(b.f._addr === undefined) fetchAddress(b.f);          // einmalig pro Gebäude anstossen, Ergebnis wird gecacht
+        const addrTxt = b.f._addr === undefined ? 'Adresse wird geladen …' : (b.f._addr || null);
         const cx = r0Center(b), s = adjust(project(cx.x, cx.y, h*0.6)), txt = info.text + (isNaN(age) ? '' : ` (${Math.round(age)} J.)`);
-        const fs = 20*devicePixelRatio, x = s ? s.x : cv.width/2, y = s ? s.y : cv.height/2;
-        ctx.globalAlpha = 1; ctx.font = `700 ${fs}px system-ui`; ctx.textAlign = 'center';
-        const w = ctx.measureText(txt).width + 24*devicePixelRatio;
-        ctx.fillStyle = 'rgba(0,0,0,.75)'; ctx.fillRect(x-w/2, y-fs, w, fs*1.7);
-        ctx.fillStyle = col; ctx.fillText(txt, x, y+fs*0.3);
+        const fs = 20*devicePixelRatio, fs2 = 14*devicePixelRatio, x = s ? s.x : cv.width/2, y = s ? s.y : cv.height/2;
+        ctx.globalAlpha = 1; ctx.textAlign = 'center';
+        ctx.font = `700 ${fs}px system-ui`;
+        const w1 = ctx.measureText(txt).width;
+        ctx.font = `400 ${fs2}px system-ui`;
+        const w2 = addrTxt ? ctx.measureText(addrTxt).width : 0;
+        const w = Math.max(w1, w2) + 24*devicePixelRatio;
+        const boxH = addrTxt ? fs*1.7 + fs2*1.5 : fs*1.7;
+        ctx.fillStyle = 'rgba(0,0,0,.75)'; ctx.fillRect(x-w/2, y-fs, w, boxH);
+        ctx.font = `700 ${fs}px system-ui`; ctx.fillStyle = col; ctx.fillText(txt, x, y+fs*0.3);
+        if(addrTxt){ ctx.font = `400 ${fs2}px system-ui`; ctx.fillStyle = '#ddd'; ctx.fillText(addrTxt, x, y+fs*0.3+fs2*1.5); }
+
+        // Blauer "i"-Knopf: an der Gebäudeposition platziert (DOM-Element, in CSS-Pixel statt Geräte-Pixel)
+        if(b.f._plaque){
+          plaqueVisible = true; plaqueShown = b.f._plaque;
+          const bx = x / devicePixelRatio, by = (y - boxH - 14*devicePixelRatio) / devicePixelRatio;
+          $('plaqueBtn').style.left = bx + 'px'; $('plaqueBtn').style.top = by + 'px';
+          $('plaqueBtn').style.display = 'flex';
+        }
         $('dbg').textContent = (realH ? `Höhe: ${realH.h.toFixed(1)} m (${realH.n} 3D-Punkte)` : `Höhe: Standard ${h} m`) +
-          ' · ' + heightDbg + ' · ' + JSON.stringify(b.f.props).slice(0,300);
+          ' · ' + heightDbg + ' · ' + plaqueDbg + ' · ' + JSON.stringify(b.f.props).slice(0,250);
       }
     }
     ctx.globalAlpha = 1;
   }
+  if(!plaqueVisible) $('plaqueBtn').style.display = 'none';
   ctx.strokeStyle = '#fff'; ctx.lineWidth = 2;
   const m = [cv.width/2, cv.height/2]; ctx.beginPath();
   ctx.moveTo(m[0]-12,m[1]); ctx.lineTo(m[0]+12,m[1]); ctx.moveTo(m[0],m[1]-12); ctx.lineTo(m[0],m[1]+12); ctx.stroke();
@@ -383,9 +528,11 @@ async function start(){
       if(!lastFetch || Math.hypot(c.e-lastFetch.e, c.n-lastFetch.n) > CFG.refetchDist) fetchData();
       if(!lastHeightFetch || Math.hypot(posWGS.lat-lastHeightFetch.lat, posWGS.lon-lastHeightFetch.lon)*111320 > CFG.refetchDist)
         fetchHeights();
+      if(!lastPlaqueFetch || Math.hypot(posWGS.lat-lastPlaqueFetch.lat, posWGS.lon-lastPlaqueFetch.lon)*111320 > CFG.refetchDist)
+        fetchPlaques();
     }, err => $('status').textContent = 'GPS-Fehler: ' + err.message, { enableHighAccuracy:true, maximumAge:1000 });
     setInterval(() => $('status').textContent = pos
-      ? `GPS ±${Math.round(acc)} m · Blick ${Math.round(heading)}° · ${feats.length} Gebäude · ${heightsInCity ? heightDbg : '3D-Höhen: ausserhalb Stadt ZH'}`
+      ? `GPS ±${Math.round(acc)} m · Blick ${Math.round(heading)}° · ${feats.length} Gebäude · ${heightsInCity ? heightDbg : '3D-Höhen: ausserhalb Stadt ZH'} · ${plaqueDbg}`
       : 'Warte auf GPS …', 400);
     $('start').style.display = 'none';
     draw();
@@ -425,6 +572,17 @@ function endTouch(e){
 }
 cv.addEventListener('pointerup', endTouch);
 cv.addEventListener('pointercancel', endTouch);
+
+/* ===== Blauer Tafel-Knopf & Modal ===== */
+$('plaqueBtn').onclick = () => {
+  if(!plaqueShown) return;
+  $('plaqueTitle').textContent = plaqueShown.title || 'Blaue Tafel';
+  $('plaqueText').textContent = plaqueShown.text + (plaqueShown.address ? `\n\n${plaqueShown.address}` : '');
+  $('plaqueRaw').textContent = JSON.stringify(plaqueShown.props).slice(0,300);
+  $('plaqueModal').style.display = 'flex';
+};
+$('plaqueClose').onclick = () => { $('plaqueModal').style.display = 'none'; };
+
 </script>
 </body>
 </html>
