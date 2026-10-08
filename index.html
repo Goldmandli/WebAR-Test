@@ -31,7 +31,6 @@
   <h2 style="margin:0">Gebäudealter AR</h2>
   <small>Kamera, Standort und Kompass werden benötigt. Halte das Handy aufrecht und ziele auf ein Haus. Daten: Gebäudealter (OGD) Kanton Zürich, Adresse (GWR) swisstopo, blaue Tafeln Stadt Zürich.</small>
   <button id="go">Starten</button>
-  <label>Eigene GeoJSON-Datei (Notlösung)<input id="file" type="file" accept=".geojson,.json" hidden></label>
   <small id="msg"></small>
 </div>
 <video id="v" playsinline muted></video>
@@ -79,10 +78,13 @@ const CFG = {
     matchBuffer: 4,        // m, Toleranz um den Grundriss beim Zuordnen der 3D-Punkte
     minHeight: 2, maxHeight: 250   // Plausibilitätsgrenzen
   },
-  // Adress-Nachschlagedienst von swisstopo (öffentlich, kein API-Schlüssel nötig).
-  address: {
-    url: 'https://api3.geo.admin.ch/rest/services/ech/MapServer/identify',
-    tolerance: 20           // m, Umkreis um den Gebäudemittelpunkt für die Adresssuche
+  // Adressen Stadt Zürich – derselbe Server wie die blauen Tafeln und historischen Fotos.
+  addresses: {
+    url: 'https://www.ogd.stadt-zuerich.ch/wfs/geoportal/Adressen_Stadt_Zuerich',
+    layer: 'adrstzh_adressen_stzh_p',
+    fetchRadius: 150,       // m, Abfrageradius
+    maxFeatures: 500,
+    matchRadius: 30         // m, wie weit ein Adresspunkt vom Gebäuderand entfernt sein darf
   },
   // Blaue Informationstafeln an Denkmalschutz-Objekten, Stadt Zürich. Punkt-Layer.
   plaques: {
@@ -99,7 +101,7 @@ let feats = [], pos = null, posWGS = null, lastFetch = null, lastHeightFetch = n
 let heading = 0, pitch = 0, hfov = 55, yearKey = null;
 let heightFeats = [], heightGrid = new Map(), heightsInCity = false, heightDbg = '';   // 3D-Höhenpunkte (lokale Koordinaten) der Stadt Zürich
 let plaqueFeats = [], plaqueGrid = new Map(), plaquesBusy = false, lastPlaqueFetch = null, plaqueDbg = '';
-let addrDbg = '';
+let addressFeats = [], addressGrid = new Map(), addressesBusy = false, lastAddressFetch = null, addressDbg = '';
 let plaqueShown = null;   // welches Tafel-Objekt gerade im blauen Button steckt (für den Klick-Handler)
 
 let userDX = 0, userDY = 0, userScale = 1;   // manuelle Verschiebung (px) / Skalierung, vom Nutzer per Touch gesetzt
@@ -139,20 +141,13 @@ async function fetchData(){
   try{
     const res = await fetch(url); const gj = await res.json();
     feats = parseGeoJSON(gj, false); lastFetch = { e:pos.e, n:pos.n };
-    yearKey = null; assignHeights(); assignPlaques();
+    yearKey = null; assignHeights(); assignPlaques(); assignAddresses();
     $('msg').textContent = feats.length + ' Gebäude geladen';
   }catch(e){
     $('dbg').textContent = 'WFS-Abfrage fehlgeschlagen (' + e.message + ') – ggf. CORS. Alternative: GeoJSON-Datei wählen.';
   }
   busy = false;
 }
-$('file').onchange = async e => {
-  const f = e.target.files[0]; if(!f) return;
-  const gj = JSON.parse(await f.text()); const c = gj.features[0].geometry.coordinates.flat(3)[0];
-  feats = parseGeoJSON(gj, Math.abs(c) < 180); lastFetch = { e:1e9, n:1e9 }; yearKey = null;
-  $('msg').textContent = feats.length + ' Gebäude aus Datei';
-};
-
 /* ===== Echte Gebäudehöhen (3D-Modell Stadt Zürich) =====
    Der Dienst liefert Dach-/Wandflächen mit echten Höhenkoordinaten (Z), aber vermutlich in mehrere
    Teile pro Gebäude zerlegt und nicht sicher mit unserem Grundriss-Layer über eine ID verknüpfbar.
@@ -256,30 +251,57 @@ function assignHeights(){
   for(const f of feats) f._h3d = computeHeight(localRings(f)[0]);
 }
 
-/* ===== Adresse (swisstopo, Gebäude- und Wohnungsregister) =====
-   Öffentlicher Dienst von swisstopo, kein API-Schlüssel nötig. Liefert zu einer Koordinate die
-   nächstgelegene Adresse aus dem eidgenössischen Gebäude- und Wohnungsregister (GWR). */
-async function fetchAddress(f){
-  if(f._addrBusy || f._addr !== undefined) return;    // schon unterwegs oder schon erledigt (auch bei "kein Ergebnis")
-  f._addrBusy = true;
-  const c = r0Center({ rs:[localRings(f)[0]] });
-  const e = pos.e + c.x, n = pos.n + c.y;
-  const url = `${CFG.address.url}?geometryType=esriGeometryPoint&geometry=${e},${n}&sr=2056` +
-    `&layers=all:ch.bfs.gebaeude_wohnungs_register&mapExtent=0,0,100,100&imageDisplay=100,100,100` +
-    `&tolerance=${CFG.address.tolerance}&geometryFormat=geojson&lang=de`;
+/* ===== Adressen (Stadt Zürich) =====
+   Punkt-Layer auf demselben Server wie die blauen Tafeln und historischen Fotos. Genaue Feldnamen
+   sind nicht sicher bekannt, deshalb generische Suche nach Strasse/Hausnummer/PLZ/Ort-Feldern. */
+async function fetchAddresses(){
+  if(addressesBusy || !posWGS) return; addressesBusy = true; addressDbg = 'Adressen: lädt …';
+  const r = CFG.addresses.fetchRadius;
+  const dLat = r/111320, dLon = r/(111320*Math.cos(posWGS.lat*rad));
+  const bbox = [posWGS.lon-dLon, posWGS.lat-dLat, posWGS.lon+dLon, posWGS.lat+dLat].join(',');
+  const url = `${CFG.addresses.url}?SERVICE=WFS&VERSION=1.0.0&REQUEST=GetFeature&TYPENAME=${CFG.addresses.layer}` +
+    `&OUTPUTFORMAT=${encodeURIComponent('application/vnd.geo+json')}&BBOX=${bbox}&MAXFEATURES=${CFG.addresses.maxFeatures}`;
   try{
+    const t0 = performance.now();
     const res = await fetch(url); const gj = await res.json();
-    const a = gj.results && gj.results[0] && gj.results[0].attributes;
-    if(a){
-      const street = a.strname_deinr || [a.strname1, a.deinr].filter(Boolean).join(' ');
-      const city = [a.plz4, a.plzname].filter(Boolean).join(' ');
-      f._addr = [street, city].filter(Boolean).join(', ') || a.label || null;
-      addrDbg = 'Adresse: OK';
-    } else { f._addr = null; addrDbg = `Adresse: kein Treffer (HTTP ${res.status})`; }
+    const pts = [];
+    for(const f of gj.features || []){
+      const g = f.geometry; if(!g || g.type !== 'Point') continue;
+      const [lon,lat] = g.coordinates, c = wgs2lv95(lat,lon);
+      pts.push({ x: c.e-pos.e, y: c.n-pos.n, props: f.properties || {} });
+    }
+    addressFeats = pts; lastAddressFetch = { lat:posWGS.lat, lon:posWGS.lon };
+    addressGrid = buildGrid(pts);
+    assignAddresses();
+    addressDbg = `${pts.length} Adresspunkte · ${Math.round(performance.now()-t0)} ms`;
   }catch(e){
-    f._addr = null; addrDbg = 'Adresse: Abfrage fehlgeschlagen (' + e.message + ')';
+    addressDbg = 'Adressen: Abfrage fehlgeschlagen (' + e.message + ')';
+    addressFeats = []; addressGrid = new Map();
   }
-  f._addrBusy = false;
+  addressesBusy = false;
+}
+function addressInfo(props){
+  const keys = Object.keys(props);
+  const streetKey = keys.find(k => /strasse|str_?name|street/i.test(k));
+  const numKey = keys.find(k => /hausnr|hausnummer|deinr|^nr1?$|number/i.test(k));
+  const plzKey = keys.find(k => /plz|postleitzahl|zip/i.test(k));
+  const placeKey = keys.find(k => /ortschaft|^ort$|gemeinde|city/i.test(k));
+  const labelKey = keys.find(k => /adresse|label|bezeichnung/i.test(k));
+  const street = streetKey ? String(props[streetKey] ?? '').trim() : '';
+  const num = numKey ? String(props[numKey] ?? '').trim() : '';
+  let line1 = [street, num].filter(Boolean).join(' ');
+  if(!line1 && labelKey) line1 = String(props[labelKey] ?? '').trim();
+  const line2 = [plzKey ? props[plzKey] : '', placeKey ? props[placeKey] : ''].filter(Boolean).join(' ');
+  return { text: [line1, line2].filter(Boolean).join(', '), props };
+}
+function assignAddresses(){
+  if(!pos || !addressFeats.length) return;
+  for(const f of feats){
+    const ring = localRings(f)[0], cand = candidatesFor(ring, CFG.addresses.matchRadius, addressGrid);
+    let best = null, bestD = CFG.addresses.matchRadius;
+    for(const p of cand){ const d = distToRing(p.x, p.y, ring); if(d < bestD){ bestD = d; best = p; } }
+    f._addr = best ? (addressInfo(best.props).text || null) : null;
+  }
 }
 
 /* ===== Blaue Informationstafeln (Denkmalschutz, Stadt Zürich) =====
@@ -474,7 +496,6 @@ function draw(){
         ctx.strokeStyle = isT ? '#fff' : col; ctx.lineWidth = (isT ? 3 : 1.5)*devicePixelRatio; ctx.stroke();
       }
       if(isT){
-        if(b.f._addr === undefined) fetchAddress(b.f);          // einmalig pro Gebäude anstossen, Ergebnis wird gecacht
         const addrTxt = b.f._addr === undefined ? 'Adresse wird geladen …' : (b.f._addr || null);
         const cx = r0Center(b), s = adjust(project(cx.x, cx.y, h*0.6)), txt = info.text + (isNaN(age) ? '' : ` (${Math.round(age)} J.)`);
         const fs = 20*devicePixelRatio, fs2 = 14*devicePixelRatio, x = s ? s.x : cv.width/2, y = s ? s.y : cv.height/2;
@@ -497,7 +518,7 @@ function draw(){
           $('plaqueBtn').style.display = 'flex';
         }
         $('dbg').textContent = (realH ? `Höhe: ${realH.h.toFixed(1)} m (${realH.n} 3D-Punkte)` : `Höhe: Standard ${h} m`) +
-          ' · ' + addrDbg + ' · ' + plaqueDbg + ' · ' + JSON.stringify(b.f.props).slice(0,200);
+          ' · ' + addressDbg + (b.f._addr ? ` → "${b.f._addr}"` : '') + ' · ' + plaqueDbg;
       }
     }
     ctx.globalAlpha = 1;
@@ -541,6 +562,8 @@ async function start(){
         fetchHeights();
       if(!lastPlaqueFetch || Math.hypot(posWGS.lat-lastPlaqueFetch.lat, posWGS.lon-lastPlaqueFetch.lon)*111320 > CFG.refetchDist)
         fetchPlaques();
+      if(!lastAddressFetch || Math.hypot(posWGS.lat-lastAddressFetch.lat, posWGS.lon-lastAddressFetch.lon)*111320 > CFG.refetchDist)
+        fetchAddresses();
     }, err => $('status').textContent = 'GPS-Fehler: ' + err.message, { enableHighAccuracy:true, maximumAge:1000 });
     setInterval(() => $('status').textContent = pos
       ? `GPS ±${Math.round(acc)} m · Blick ${Math.round(heading)}° · ${feats.length} Gebäude · ${heightsInCity ? heightDbg : '3D-Höhen: ausserhalb Stadt ZH'} · ${plaqueDbg}`
