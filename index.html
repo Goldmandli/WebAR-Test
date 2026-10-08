@@ -81,7 +81,7 @@ const CFG = {
   },
   // Adress-Nachschlagedienst von swisstopo (öffentlich, kein API-Schlüssel nötig).
   address: {
-    url: 'https://api3.geo.admin.ch/rest/services/api/MapServer/identify',
+    url: 'https://api3.geo.admin.ch/rest/services/ech/MapServer/identify',
     tolerance: 20           // m, Umkreis um den Gebäudemittelpunkt für die Adresssuche
   },
   // Blaue Informationstafeln an Denkmalschutz-Objekten, Stadt Zürich. Punkt-Layer.
@@ -99,6 +99,7 @@ let feats = [], pos = null, posWGS = null, lastFetch = null, lastHeightFetch = n
 let heading = 0, pitch = 0, hfov = 55, yearKey = null;
 let heightFeats = [], heightGrid = new Map(), heightsInCity = false, heightDbg = '';   // 3D-Höhenpunkte (lokale Koordinaten) der Stadt Zürich
 let plaqueFeats = [], plaqueGrid = new Map(), plaquesBusy = false, lastPlaqueFetch = null, plaqueDbg = '';
+let addrDbg = '';
 let plaqueShown = null;   // welches Tafel-Objekt gerade im blauen Button steckt (für den Klick-Handler)
 
 let userDX = 0, userDY = 0, userScale = 1;   // manuelle Verschiebung (px) / Skalierung, vom Nutzer per Touch gesetzt
@@ -273,9 +274,10 @@ async function fetchAddress(f){
       const street = a.strname_deinr || [a.strname1, a.deinr].filter(Boolean).join(' ');
       const city = [a.plz4, a.plzname].filter(Boolean).join(' ');
       f._addr = [street, city].filter(Boolean).join(', ') || a.label || null;
-    } else f._addr = null;
+      addrDbg = 'Adresse: OK';
+    } else { f._addr = null; addrDbg = `Adresse: kein Treffer (HTTP ${res.status})`; }
   }catch(e){
-    f._addr = null;
+    f._addr = null; addrDbg = 'Adresse: Abfrage fehlgeschlagen (' + e.message + ')';
   }
   f._addrBusy = false;
 }
@@ -495,7 +497,7 @@ function draw(){
           $('plaqueBtn').style.display = 'flex';
         }
         $('dbg').textContent = (realH ? `Höhe: ${realH.h.toFixed(1)} m (${realH.n} 3D-Punkte)` : `Höhe: Standard ${h} m`) +
-          ' · ' + heightDbg + ' · ' + plaqueDbg + ' · ' + JSON.stringify(b.f.props).slice(0,250);
+          ' · ' + addrDbg + ' · ' + plaqueDbg + ' · ' + JSON.stringify(b.f.props).slice(0,200);
       }
     }
     ctx.globalAlpha = 1;
