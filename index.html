@@ -433,11 +433,20 @@ function draw(){
 
     // Bildschirm-Quads einmal berechnen (inkl. manueller Verschiebung/Zoom) – werden fürs Zeichnen
     // UND für die Fadenkreuz-Erkennung gebraucht, damit beides exakt zusammenpasst.
+    // Backface-Culling: nur Wandflächen zeichnen, deren Aussenseite zur Kamera (= lokaler Nullpunkt) zeigt,
+    // damit die vom Betrachter weg zeigenden Rückseiten nicht mehr durchscheinen.
     for(const b of list){
       const quads = [];
       for(const ring of b.rs){
+        let area = 0;                               // Shoelace-Formel: Vorzeichen zeigt Umlaufrichtung (CW/CCW)
+        for(let i=0, j=ring.length-1; i<ring.length; j=i++) area += ring[j].x*ring[i].y - ring[i].x*ring[j].y;
+        const ccw = area > 0;
         const gr = ring.map(p => adjust(project(p.x,p.y,0))), rf = ring.map(p => adjust(project(p.x,p.y,b._h)));
         for(let i=0;i<ring.length-1;i++){
+          const p = ring[i], q2 = ring[i+1], dx = q2.x-p.x, dy = q2.y-p.y;
+          const nx = ccw ? dy : -dy, ny = ccw ? -dx : dx;              // Aussennormale dieser Kante
+          const mx = (p.x+q2.x)/2, my = (p.y+q2.y)/2;                  // Kantenmitte, Kamera steht lokal bei (0,0)
+          if(nx*mx + ny*my >= 0) continue;                             // zeigt von der Kamera weg → nicht zeichnen
           const q = [gr[i],gr[i+1],rf[i+1],rf[i]];
           if(!q.some(v => !v)) quads.push(q);
         }
