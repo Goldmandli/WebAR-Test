@@ -282,14 +282,19 @@ async function fetchAddresses(){
 }
 function addressInfo(props){
   const keys = Object.keys(props);
-  const streetKey = keys.find(k => /strasse|str_?name|street/i.test(k));
-  const numKey = keys.find(k => /hausnr|hausnummer|deinr|^nr1?$|number/i.test(k));
-  const plzKey = keys.find(k => /plz|postleitzahl|zip/i.test(k));
-  const placeKey = keys.find(k => /ortschaft|^ort$|gemeinde|city/i.test(k));
-  const labelKey = keys.find(k => /adresse|label|bezeichnung/i.test(k));
+  // "adresse" (z.B. "Federnstrasse 1") liefert Strasse+Nr. bereits fertig kombiniert
+  // und ist bei der Stadt-Zürich-Adressschicht zuverlässiger als die einzelnen Felder
+  // (der Strassenname steckt dort in "lokalisationsname", nicht in einem "strasse"-Feld).
+  const fullKey = keys.find(k => /^adresse$/i.test(k));
+  const streetKey = keys.find(k => /lokalisationsname|strassenname|^strasse$|str_?name|street/i.test(k));
+  const numKey = keys.find(k => /hausnummer|hausnr|deinr|^nr1?$|number/i.test(k));
+  const plzKey = keys.find(k => /plz(?!_)|postleitzahl|zip/i.test(k));
+  const placeKey = keys.find(k => /plz_ortschaft|ortschaft|^ort$|gemeinde|city/i.test(k));
+  const labelKey = keys.find(k => /label|bezeichnung/i.test(k));
   const street = streetKey ? String(props[streetKey] ?? '').trim() : '';
   const num = numKey ? String(props[numKey] ?? '').trim() : '';
-  let line1 = [street, num].filter(Boolean).join(' ');
+  let line1 = fullKey ? String(props[fullKey] ?? '').trim() : '';
+  if(!line1) line1 = [street, num].filter(Boolean).join(' ');
   if(!line1 && labelKey) line1 = String(props[labelKey] ?? '').trim();
   const line2 = [plzKey ? props[plzKey] : '', placeKey ? props[placeKey] : ''].filter(Boolean).join(' ');
   return { text: [line1, line2].filter(Boolean).join(', '), props };
