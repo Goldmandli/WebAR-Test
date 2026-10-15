@@ -93,12 +93,23 @@ const CFG = {
     fetchRadius: 150,       // m, Abfrageradius
     maxFeatures: 500,
     matchRadius: 25         // m, wie weit eine Tafel vom Gebäuderand entfernt sein darf
+  },
+  // Magnetische Deklination für Zürich (Abweichung magnetisch→wahrer Norden), ca. +3° Ost, Stand 2026.
+  // Nur für Android nötig: iOS liefert mit webkitCompassHeading bereits einen Wert relativ zu Norden.
+  declination: 3.0,
+  gps: {
+    minAlpha: 0.07,   // min. Glättungsgewicht pro neuem Fix (bei sehr ungenauem GPS)
+    maxAlpha: 0.9,    // max. Glättungsgewicht (bei sehr genauem GPS)
+    refAccuracy: 6,   // m, Genauigkeit, ab der praktisch ungeglättet übernommen wird
+    maxWalkSpeed: 2.2,  // m/s, Plausibilitätsgrenze (zügiges Gehen) für Ausreisser-Erkennung
+    outlierFactor: 3    // Sprünge über maxWalkSpeed*dt*outlierFactor+Genauigkeit werden verworfen
   }
 };
 
 /* ===== Zustand ===== */
 let feats = [], pos = null, posWGS = null, lastFetch = null, lastHeightFetch = null, busy = false, heightsBusy = false;
 let heading = 0, pitch = 0, hfov = 55, yearKey = null;
+let lastFixTime = null, gpsAcc = null;   // für die genauigkeitsgewichtete GPS-Glättung
 let heightFeats = [], heightGrid = new Map(), heightsInCity = false, heightDbg = '';   // 3D-Höhenpunkte (lokale Koordinaten) der Stadt Zürich
 let plaqueFeats = [], plaqueGrid = new Map(), plaquesBusy = false, lastPlaqueFetch = null, plaqueDbg = '';
 let addressFeats = [], addressGrid = new Map(), addressesBusy = false, lastAddressFetch = null, addressDbg = '';
@@ -539,12 +550,13 @@ function draw(){
 const smooth = (cur, next, k=0.25) => (cur + (((next-cur+540)%360)-180)*k + 360) % 360;
 function onOrient(e){
   let h;
-  if(e.webkitCompassHeading != null) h = e.webkitCompassHeading;             // iOS
-  else if(e.alpha != null){                                                  // Android
+  if(e.webkitCompassHeading != null) h = e.webkitCompassHeading;             // iOS: bereits Richtung wahrer Norden
+  else if(e.alpha != null){                                                  // Android: magnetischer Norden
     const a = e.alpha*rad, b = (e.beta||0)*rad, g = (e.gamma||0)*rad;
     const vx = -Math.cos(a)*Math.sin(g) - Math.sin(a)*Math.sin(b)*Math.cos(g);
     const vy = -Math.sin(a)*Math.sin(g) + Math.cos(a)*Math.sin(b)*Math.cos(g);
     h = Math.atan2(vx, vy)*deg; if(h < 0) h += 360;
+    h = (h + CFG.declination + 360) % 360;   // auf wahren Norden korrigieren, wie bei iOS
   } else return;
   heading = smooth(heading, h);
   if(e.beta != null) pitch = pitch*0.75 + (e.beta - 90)*0.25;
@@ -560,8 +572,25 @@ async function start(){
     window.addEventListener('deviceorientation', e => { if(!('ondeviceorientationabsolute' in window)) onOrient(e); }, true);
     let acc = 0;
     navigator.geolocation.watchPosition(p => {
-      const c = wgs2lv95(p.coords.latitude, p.coords.longitude); pos = c; acc = p.coords.accuracy;
-      posWGS = { lat:p.coords.latitude, lon:p.coords.longitude };
+      const c = wgs2lv95(p.coords.latitude, p.coords.longitude); acc = p.coords.accuracy || 30;
+      posWGS = { lat:p.coords.latitude, lon:p.coords.longitude };   // roh, nur für Nachlade-BBoxen (Radius verzeiht das)
+      const now = performance.now();
+      if(!pos){
+        pos = c;   // erster Fix: ungeglättet übernehmen, sonst würde man am Anfang ewig "hinterherlaufen"
+      } else {
+        const dt = Math.max((now - (lastFixTime || now)) / 1000, 0.2);
+        const dist = Math.hypot(c.e - pos.e, c.n - pos.n);
+        const plausible = CFG.gps.maxWalkSpeed * dt * CFG.gps.outlierFactor + acc;
+        if(dist <= plausible){
+          // Genauigkeitsgewichtete Glättung: ein sehr präziser Fix wird fast ungeglättet übernommen,
+          // ein ungenauer Fix (schlechtes GPS, Schluchten etc.) nur sanft eingemischt. Das verhindert
+          // das Springen der Gebäude bei einzelnen schlechten Fixes, ohne echte Bewegung zu verschlucken.
+          const alpha = Math.min(CFG.gps.maxAlpha, Math.max(CFG.gps.minAlpha, CFG.gps.refAccuracy / acc));
+          pos = { e: pos.e + (c.e - pos.e) * alpha, n: pos.n + (c.n - pos.n) * alpha };
+        }
+        // sonst: Ausreisser, verwerfen – pos bleibt wie es war
+      }
+      lastFixTime = now; gpsAcc = acc;
       if(!lastFetch || Math.hypot(c.e-lastFetch.e, c.n-lastFetch.n) > CFG.refetchDist) fetchData();
       if(!lastHeightFetch || Math.hypot(posWGS.lat-lastHeightFetch.lat, posWGS.lon-lastHeightFetch.lon)*111320 > CFG.refetchDist)
         fetchHeights();
