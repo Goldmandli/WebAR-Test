@@ -24,6 +24,9 @@
   #plaqueModal p{margin:0;font-size:15px;line-height:1.5;max-width:60ch;white-space:pre-wrap}
   #plaqueClose{position:absolute;top:calc(16px + env(safe-area-inset-top,0px));right:16px;background:#333;color:#fff;
     border:1px solid #666;border-radius:50%;width:42px;height:42px;font-size:18px}
+  #streetBtn{position:fixed;width:34px;height:34px;border-radius:50%;background:#111;color:#fff;
+    border:2px solid #fff;font-weight:800;font-size:16px;display:none;align-items:center;justify-content:center;
+    z-index:6;box-shadow:0 2px 6px rgba(0,0,0,.5);transform:translate(-50%,-50%)}
 </style>
 </head>
 <body>
@@ -36,6 +39,7 @@
 <video id="v" playsinline muted></video>
 <canvas id="c"></canvas>
 <button id="plaqueBtn">i</button>
+<button id="streetBtn">i</button>
 <div id="plaqueModal">
   <button id="plaqueClose">✕</button>
   <h3 id="plaqueTitle">Blaue Tafel</h3>
@@ -94,6 +98,16 @@ const CFG = {
     maxFeatures: 500,
     matchRadius: 25         // m, wie weit eine Tafel vom Gebäuderand entfernt sein darf
   },
+  // Strassennamenverzeichnis Stadt Zürich (Linien je Strassenabschnitt), inkl. Namensherkunft.
+  streets: {
+    url: 'https://www.ogd.stadt-zuerich.ch/wfs/geoportal/Strassennamenverzeichnis',
+    layer: 'sv_str_lin',
+    fetchRadius: 150,
+    maxFeatures: 300,
+    matchRadius: 40,    // m, wie weit die eigene Position von der Strassenlinie entfernt sein darf
+    nearDist: 2.5,       // m, wie weit vor einem das Bodenschild beginnt
+    labelWidth: 1.4       // m, "Höhe" der Buchstaben quer zur Strasse
+  },
   // Magnetische Deklination für Zürich (Abweichung magnetisch→wahrer Norden), ca. +3° Ost, Stand 2026.
   // Nur für Android nötig: iOS liefert mit webkitCompassHeading bereits einen Wert relativ zu Norden.
   declination: 3.0,
@@ -111,6 +125,9 @@ let feats = [], pos = null, posWGS = null, lastFetch = null, lastHeightFetch = n
 let heading = 0, pitch = 0, hfov = 55, yearKey = null;
 let lastFixTime = null, gpsAcc = null;   // für die genauigkeitsgewichtete GPS-Glättung
 let occCv = null, occCtx = null, layerCv = null, layerCtx = null;   // Offscreen-Canvases für die Verdeckung hinterer Gebäude
+let streetFeats = [], streetsBusy = false, lastStreetFetch = null, streetDbg = '';
+let streetShown = null;                          // für das Infofenster (Name + Namensherkunft)
+const streetLabelCache = new Map();              // Name → gerenderte Text-Textur (einmal pro Name berechnet)
 let heightFeats = [], heightGrid = new Map(), heightsInCity = false, heightDbg = '';   // 3D-Höhenpunkte (lokale Koordinaten) der Stadt Zürich
 let plaqueFeats = [], plaqueGrid = new Map(), plaquesBusy = false, lastPlaqueFetch = null, plaqueDbg = '';
 let addressFeats = [], addressGrid = new Map(), addressesBusy = false, lastAddressFetch = null, addressDbg = '';
@@ -319,6 +336,101 @@ function assignAddresses(){
     for(const p of cand){ const d = distToRing(p.x, p.y, ring); if(d < bestD){ bestD = d; best = p; } }
     f._addr = best ? (addressInfo(best.props).text || null) : null;
   }
+}
+
+/* ===== Strassennamen (Stadt Zürich) – Bodenschild wie bei Google Maps, inkl. Namensherkunft =====
+   Linien-Layer (ein oder mehrere Abschnitte je Strasse). Wir merken uns für jede Linie alle Teilstrecken
+   in absoluten LV95-Koordinaten und suchen pro Frame die Teilstrecke, die der eigenen Position am
+   nächsten liegt – das Schild erscheint also automatisch für die Strasse, auf der man gerade steht. */
+async function fetchStreets(){
+  if(streetsBusy || !posWGS) return; streetsBusy = true; streetDbg = 'Strassen: lädt …';
+  const r = CFG.streets.fetchRadius;
+  const dLat = r/111320, dLon = r/(111320*Math.cos(posWGS.lat*rad));
+  const bbox = [posWGS.lon-dLon, posWGS.lat-dLat, posWGS.lon+dLon, posWGS.lat+dLat].join(',');
+  const url = `${CFG.streets.url}?SERVICE=WFS&VERSION=1.0.0&REQUEST=GetFeature&TYPENAME=${CFG.streets.layer}` +
+    `&OUTPUTFORMAT=${encodeURIComponent('application/vnd.geo+json')}&BBOX=${bbox}&MAXFEATURES=${CFG.streets.maxFeatures}`;
+  try{
+    const t0 = performance.now();
+    const res = await fetch(url); const gj = await res.json();
+    const out = [];
+    for(const f of gj.features || []){
+      const g = f.geometry; if(!g) continue;
+      const lines = g.type === 'MultiLineString' ? g.coordinates : g.type === 'LineString' ? [g.coordinates] : null;
+      if(!lines) continue;
+      const name = streetName(f.properties), erl = streetErl(f.properties);
+      if(!name) continue;
+      const segs = [];
+      for(const line of lines){
+        const pts = line.map(([lon,lat]) => wgs2lv95(lat,lon));
+        for(let i=0;i<pts.length-1;i++) segs.push([pts[i], pts[i+1]]);
+      }
+      if(segs.length) out.push({ name, erl, props: f.properties, segs });
+    }
+    streetFeats = out; lastStreetFetch = { lat:posWGS.lat, lon:posWGS.lon };
+    streetDbg = `${out.length} Strassenabschnitte · ${Math.round(performance.now()-t0)} ms`;
+  }catch(e){
+    streetDbg = 'Strassen: Abfrage fehlgeschlagen (' + e.message + ')';
+    streetFeats = [];
+  }
+  streetsBusy = false;
+}
+function streetName(props){
+  const keys = Object.keys(props);
+  const k = keys.find(x => /^str_name$/i.test(x)) || keys.find(x => /strassenname|str_?name/i.test(x));
+  return k ? String(props[k] ?? '').trim() : '';
+}
+function streetErl(props){
+  const keys = Object.keys(props);
+  const k = keys.find(x => /snb_erlaeuterung/i.test(x)) || keys.find(x => /erlaeuterung|erklaerung/i.test(x));
+  return k ? String(props[k] ?? '').trim() : '';
+}
+function nearestStreet(){                        // nächstgelegene Teilstrecke zur eigenen (absoluten) Position
+  if(!pos || !streetFeats.length) return null;
+  let best = null, bestD = CFG.streets.matchRadius;
+  for(const f of streetFeats){
+    for(const [a,b] of f.segs){
+      const d = distToSeg(pos.e, pos.n, a.e, a.n, b.e, b.n);
+      if(d < bestD){ bestD = d; best = { f, a, b }; }
+    }
+  }
+  return best;
+}
+function streetLabelTexture(name){                // Text einmal pro Name auf eine Offscreen-Canvas rendern
+  let lbl = streetLabelCache.get(name);
+  if(lbl) return lbl;
+  const H = 160, pad = 50;
+  const tmp = document.createElement('canvas');
+  let tctx = tmp.getContext('2d');
+  tctx.font = `800 ${H*0.62}px system-ui`;
+  const w = Math.ceil(tctx.measureText(name).width) + pad*2;
+  tmp.width = w; tmp.height = H;
+  tctx = tmp.getContext('2d');                    // nach Resize neu holen, Resize leert den Kontext
+  tctx.font = `800 ${H*0.62}px system-ui`; tctx.textAlign = 'center'; tctx.textBaseline = 'middle';
+  tctx.lineJoin = 'round'; tctx.lineWidth = H*0.16; tctx.strokeStyle = 'rgba(255,255,255,.9)';
+  tctx.strokeText(name, w/2, H/2);                 // heller Rand für Lesbarkeit auf dunklem Belag
+  tctx.fillStyle = '#111'; tctx.fillText(name, w/2, H/2);
+  lbl = { cv: tmp, w, h: H };
+  streetLabelCache.set(name, lbl);
+  return lbl;
+}
+function triAffine(s0,s1,s2, d0,d1,d2){           // affine Abbildung Quell- auf Zieldreieck (für Textur-Mapping)
+  const sx1=s1[0]-s0[0], sy1=s1[1]-s0[1], sx2=s2[0]-s0[0], sy2=s2[1]-s0[1];
+  const dx1=d1[0]-d0[0], dy1=d1[1]-d0[1], dx2=d2[0]-d0[0], dy2=d2[1]-d0[1];
+  const det = sx1*sy2 - sx2*sy1;
+  if(Math.abs(det) < 1e-9) return null;
+  const inv = 1/det;
+  const a = (dx1*sy2 - dx2*sy1)*inv, c = (dx2*sx1 - dx1*sx2)*inv;
+  const b = (dy1*sy2 - dy2*sy1)*inv, d = (dy2*sx1 - dy1*sx2)*inv;
+  const e = d0[0] - (a*s0[0] + c*s0[1]), f = d0[1] - (b*s0[0] + d*s0[1]);
+  return [a,b,c,d,e,f];
+}
+function drawTexTriangle(ctx2, img, s0,s1,s2, d0,d1,d2){
+  const m = triAffine(s0,s1,s2, d0,d1,d2); if(!m) return;
+  ctx2.save();
+  ctx2.beginPath(); ctx2.moveTo(d0[0],d0[1]); ctx2.lineTo(d1[0],d1[1]); ctx2.lineTo(d2[0],d2[1]); ctx2.closePath(); ctx2.clip();
+  ctx2.setTransform(m[0],m[1],m[2],m[3],m[4],m[5]); ctx2.drawImage(img, 0, 0);
+  ctx2.setTransform(1,0,0,1,0,0);
+  ctx2.restore();
 }
 
 /* ===== Blaue Informationstafeln (Denkmalschutz, Stadt Zürich) =====
@@ -570,6 +682,46 @@ function draw(){
     }
     ctx.globalAlpha = 1;
   }
+
+  // Strassenschild am Boden, perspektivisch wie bei Google Maps: automatisch die Strasse, auf der man
+  // gerade steht, beginnend ein Stück vor einem und in Strassenrichtung in die Ferne gezogen. Der
+  // schwarze "i"-Knopf erscheint erst, wenn das Fadenkreuz (Bildschirmmitte) genau auf dem Schild liegt.
+  let streetVisible = false;
+  const cur = pos ? nearestStreet() : null;
+  if(cur){
+    let dx = cur.b.e - cur.a.e, dy = cur.b.n - cur.a.n;
+    const len = Math.hypot(dx,dy) || 1; dx /= len; dy /= len;
+    const fwdX = Math.sin(heading*rad), fwdY = Math.cos(heading*rad);
+    if(dx*fwdX + dy*fwdY < 0){ dx = -dx; dy = -dy; }           // immer von der Kamera weg ausrichten
+    const px = -dy, py = dx;                                   // Senkrechte zur Strasse
+
+    const nameLen = Math.max(6, Math.min(18, cur.f.name.length * 0.85));
+    const nearD = CFG.streets.nearDist, farD = nearD + nameLen, hw = CFG.streets.labelWidth/2;
+    const nearPt = { x: dx*nearD, y: dy*nearD }, farPt = { x: dx*farD, y: dy*farD };
+    const nearLeft  = adjust(project(nearPt.x - px*hw, nearPt.y - py*hw, 0));
+    const nearRight = adjust(project(nearPt.x + px*hw, nearPt.y + py*hw, 0));
+    const farLeft    = adjust(project(farPt.x - px*hw, farPt.y - py*hw, 0));
+    const farRight   = adjust(project(farPt.x + px*hw, farPt.y + py*hw, 0));
+
+    if(nearLeft && nearRight && farLeft && farRight){
+      const lbl = streetLabelTexture(cur.f.name);
+      const nl = [nearLeft.x,nearLeft.y], nr = [nearRight.x,nearRight.y], fl = [farLeft.x,farLeft.y], fr = [farRight.x,farRight.y];
+      // Quelltextur: x-Achse = entlang der Strasse (nah→fern), y-Achse = quer zur Strasse (links→rechts)
+      drawTexTriangle(ctx, lbl.cv, [0,0],[lbl.w,0],[0,lbl.h], nl, fl, nr);
+      drawTexTriangle(ctx, lbl.cv, [lbl.w,lbl.h],[lbl.w,0],[0,lbl.h], fr, fl, nr);
+
+      const cxS2 = cv.width/2, cyS2 = cv.height/2;
+      if(cur.f.erl && pointInPoly(cxS2, cyS2, [nearLeft, farLeft, farRight, nearRight])){
+        streetVisible = true; streetShown = cur.f;
+        const mx = (nearLeft.x+nearRight.x+farLeft.x+farRight.x)/4, my = (nearLeft.y+nearRight.y+farLeft.y+farRight.y)/4;
+        $('streetBtn').style.left = (mx/devicePixelRatio) + 'px';
+        $('streetBtn').style.top = (my/devicePixelRatio - 30) + 'px';
+        $('streetBtn').style.display = 'flex';
+      }
+    }
+  }
+  if(!streetVisible) $('streetBtn').style.display = 'none';
+
   if(!plaqueVisible) $('plaqueBtn').style.display = 'none';
   ctx.strokeStyle = '#fff'; ctx.lineWidth = 2;
   const m = [cv.width/2, cv.height/2]; ctx.beginPath();
@@ -629,9 +781,11 @@ async function start(){
         fetchPlaques();
       if(!lastAddressFetch || Math.hypot(posWGS.lat-lastAddressFetch.lat, posWGS.lon-lastAddressFetch.lon)*111320 > CFG.refetchDist)
         fetchAddresses();
+      if(!lastStreetFetch || Math.hypot(posWGS.lat-lastStreetFetch.lat, posWGS.lon-lastStreetFetch.lon)*111320 > CFG.refetchDist)
+        fetchStreets();
     }, err => $('status').textContent = 'GPS-Fehler: ' + err.message, { enableHighAccuracy:true, maximumAge:1000 });
     setInterval(() => $('status').textContent = pos
-      ? `GPS ±${Math.round(acc)} m · Blick ${Math.round(heading)}° · ${feats.length} Gebäude · ${heightsInCity ? heightDbg : '3D-Höhen: ausserhalb Stadt ZH'} · ${plaqueDbg}`
+      ? `GPS ±${Math.round(acc)} m · Blick ${Math.round(heading)}° · ${feats.length} Gebäude · ${heightsInCity ? heightDbg : '3D-Höhen: ausserhalb Stadt ZH'} · ${plaqueDbg} · ${streetDbg}`
       : 'Warte auf GPS …', 400);
     $('start').style.display = 'none';
     draw();
@@ -681,6 +835,15 @@ $('plaqueBtn').onclick = () => {
   $('plaqueModal').style.display = 'flex';
 };
 $('plaqueClose').onclick = () => { $('plaqueModal').style.display = 'none'; };
+
+/* ===== Strassenschild: gleiches Modal wie die blaue Tafel, nur mit Strassenname/-herkunft gefüllt ===== */
+$('streetBtn').onclick = () => {
+  if(!streetShown) return;
+  $('plaqueTitle').textContent = streetShown.name || 'Strasse';
+  $('plaqueText').textContent = streetShown.erl || '';
+  $('plaqueRaw').textContent = JSON.stringify(streetShown.props).slice(0,300);
+  $('plaqueModal').style.display = 'flex';
+};
 
 </script>
 </body>
