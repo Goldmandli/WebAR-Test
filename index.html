@@ -110,6 +110,7 @@ const CFG = {
 let feats = [], pos = null, posWGS = null, lastFetch = null, lastHeightFetch = null, busy = false, heightsBusy = false;
 let heading = 0, pitch = 0, hfov = 55, yearKey = null;
 let lastFixTime = null, gpsAcc = null;   // für die genauigkeitsgewichtete GPS-Glättung
+let occCv = null, occCtx = null, layerCv = null, layerCtx = null;   // Offscreen-Canvases für die Verdeckung hinterer Gebäude
 let heightFeats = [], heightGrid = new Map(), heightsInCity = false, heightDbg = '';   // 3D-Höhenpunkte (lokale Koordinaten) der Stadt Zürich
 let plaqueFeats = [], plaqueGrid = new Map(), plaquesBusy = false, lastPlaqueFetch = null, plaqueDbg = '';
 let addressFeats = [], addressGrid = new Map(), addressesBusy = false, lastAddressFetch = null, addressDbg = '';
@@ -502,15 +503,45 @@ function draw(){
       if(list[i]._quads.some(q => pointInPoly(cxS, cyS, q))) target = list[i];
     }
 
-    ctx.lineWidth = 2*devicePixelRatio;
+    // Nur die vorderste, sichtbare Häuserzeile anzeigen: wir malen von nah nach fern und "stanzen"
+    // bei jedem weiter entfernten Gebäude die Fläche aus, die ein näheres Gebäude schon bedeckt –
+    // dadurch schimmern dahinterliegende Gebäude nicht mehr durch, obwohl jedes einzelne transparent bleibt.
+    if(!occCv || occCv.width !== cv.width || occCv.height !== cv.height){
+      occCv = document.createElement('canvas'); occCv.width = cv.width; occCv.height = cv.height; occCtx = occCv.getContext('2d');
+      layerCv = document.createElement('canvas'); layerCv.width = cv.width; layerCv.height = cv.height; layerCtx = layerCv.getContext('2d');
+    }
+    occCtx.clearRect(0, 0, occCv.width, occCv.height);
+    for(let i = list.length-1; i >= 0; i--){            // list ist fern→nah sortiert; wir brauchen nah→fern
+      const b = list[i];
+      if(!b._quads.length) continue;
+      const isT = b === target, info = ageInfo(b.f.props);
+      const col = isNaN(info.year) ? '#aaa' : yearColor(info.year);
+
+      layerCtx.clearRect(0, 0, layerCv.width, layerCv.height);
+      layerCtx.globalCompositeOperation = 'source-over';
+      for(const q of b._quads){
+        layerCtx.beginPath(); q.forEach((v,k) => k ? layerCtx.lineTo(v.x,v.y) : layerCtx.moveTo(v.x,v.y)); layerCtx.closePath();
+        layerCtx.globalAlpha = isT ? .55 : .4; layerCtx.fillStyle = col; layerCtx.fill();   // deutlich durchsichtiger als bisher
+        layerCtx.globalAlpha = 1; layerCtx.strokeStyle = isT ? '#fff' : col;
+        layerCtx.lineWidth = (isT ? 3 : 1.5)*devicePixelRatio; layerCtx.stroke();
+      }
+      // den Teil wieder entfernen, der schon von einem näheren Gebäude belegt ist
+      layerCtx.globalCompositeOperation = 'destination-out';
+      layerCtx.globalAlpha = 1; layerCtx.drawImage(occCv, 0, 0);
+      layerCtx.globalCompositeOperation = 'source-over';
+      ctx.globalAlpha = 1; ctx.drawImage(layerCv, 0, 0);
+
+      // eigene Fläche als "belegt" markieren, damit weiter entfernte Gebäude dort nicht mehr zeichnen
+      occCtx.globalAlpha = 1; occCtx.fillStyle = '#000';
+      for(const q of b._quads){
+        occCtx.beginPath(); q.forEach((v,k) => k ? occCtx.lineTo(v.x,v.y) : occCtx.moveTo(v.x,v.y)); occCtx.closePath();
+        occCtx.fill();
+      }
+    }
+
     for(const b of list){
       const isT = b === target, info = ageInfo(b.f.props), h = b._h, realH = b._realH;
       const age = now - info.year, col = isNaN(info.year) ? '#aaa' : yearColor(info.year);
-      for(const q of b._quads){
-        ctx.beginPath(); q.forEach((v,k) => k ? ctx.lineTo(v.x,v.y) : ctx.moveTo(v.x,v.y)); ctx.closePath();
-        ctx.globalAlpha = isT ? .85 : .7; ctx.fillStyle = col; ctx.fill();   // leicht transparent, Verdeckung bleibt durch Zeichenreihenfolge erhalten
-        ctx.strokeStyle = isT ? '#fff' : col; ctx.lineWidth = (isT ? 3 : 1.5)*devicePixelRatio; ctx.stroke();
-      }
       if(isT){
         const addrTxt = b.f._addr === undefined ? 'Adresse wird geladen …' : (b.f._addr || null);
         const cx = r0Center(b), s = adjust(project(cx.x, cx.y, h*0.6)), txt = info.text + (isNaN(age) ? '' : ` (${Math.round(age)} J.)`);
