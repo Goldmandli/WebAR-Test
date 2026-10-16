@@ -139,7 +139,7 @@ let feats = [], pos = null, posWGS = null, lastFetch = null, lastHeightFetch = n
 let heading = 0, pitch = 0, hfov = 55, yearKey = null;
 let lastFixTime = null, gpsAcc = null;   // für die genauigkeitsgewichtete GPS-Glättung
 let occCv = null, occCtx = null, layerCv = null, layerCtx = null;   // Offscreen-Canvases für die Verdeckung hinterer Gebäude
-let streetFeats = [], streetsBusy = false, lastStreetFetch = null, streetDbg = '';
+let streetFeats = [], streetGrid = new Map(), streetsBusy = false, lastStreetFetch = null, streetDbg = '';
 let streetShown = null;                          // für das Infofenster (Name + Namensherkunft)
 const streetLabelCache = new Map();              // Name → gerenderte Text-Textur (einmal pro Name berechnet)
 let heightFeats = [], heightGrid = new Map(), heightsInCity = false, heightDbg = '';   // 3D-Höhenpunkte (lokale Koordinaten) der Stadt Zürich
@@ -366,7 +366,15 @@ async function fetchStreets(){
   try{
     const t0 = performance.now();
     const res = await fetch(url); const gj = await res.json();
+    // Die WFS-BBOX filtert nur, WELCHE Strassen zurückkommen – jede Linie wird dabei aber in voller
+    // Länge (ganze Strasse, oft hunderte Stützpunkte) geliefert, nicht auf die Umgebung zugeschnitten.
+    // Das hat Laden und die Suche pro Frame stark verlangsamt. Deshalb hier zuschneiden (nur Punkte
+    // nahe der eigenen Position behalten) und grob ausdünnen (zu dicht beieinanderliegende Punkte
+    // zusammenfassen) – für die Anzeige reicht eine grobe Richtung völlig.
+    const center = wgs2lv95(posWGS.lat, posWGS.lon);
+    const keepR = r * 1.3, minStep = 4;
     const out = [];
+    let totalSegs = 0;
     for(const f of gj.features || []){
       const g = f.geometry; if(!g) continue;
       const lines = g.type === 'MultiLineString' ? g.coordinates : g.type === 'LineString' ? [g.coordinates] : null;
@@ -375,16 +383,23 @@ async function fetchStreets(){
       if(!name) continue;
       const segs = [];
       for(const line of lines){
-        const pts = line.map(([lon,lat]) => wgs2lv95(lat,lon));
-        for(let i=0;i<pts.length-1;i++) segs.push([pts[i], pts[i+1]]);
+        const full = line.map(([lon,lat]) => wgs2lv95(lat,lon));
+        const near = full.filter(p => Math.hypot(p.e-center.e, p.n-center.n) <= keepR);
+        if(near.length < 2) continue;
+        const thin = [near[0]];
+        for(let i=1;i<near.length;i++){
+          const last = thin[thin.length-1];
+          if(i === near.length-1 || Math.hypot(near[i].e-last.e, near[i].n-last.n) >= minStep) thin.push(near[i]);
+        }
+        for(let i=0;i<thin.length-1;i++) segs.push([thin[i], thin[i+1]]);
       }
-      if(segs.length) out.push({ name, erl, props: f.properties, segs });
+      if(segs.length){ out.push({ name, erl, props: f.properties, segs }); totalSegs += segs.length; }
     }
-    streetFeats = out; lastStreetFetch = { lat:posWGS.lat, lon:posWGS.lon };
-    streetDbg = `${out.length} Strassenabschnitte · ${Math.round(performance.now()-t0)} ms`;
+    streetFeats = out; streetGrid = buildStreetGrid(); lastStreetFetch = { lat:posWGS.lat, lon:posWGS.lon };
+    streetDbg = `${out.length} Strassen/${totalSegs} Abschnitte · ${Math.round(performance.now()-t0)} ms`;
   }catch(e){
     streetDbg = 'Strassen: Abfrage fehlgeschlagen (' + e.message + ')';
-    streetFeats = [];
+    streetFeats = []; streetGrid = new Map();
   }
   streetsBusy = false;
 }
@@ -398,14 +413,19 @@ function streetErl(props){
   const k = keys.find(x => /snb_erlaeuterung/i.test(x)) || keys.find(x => /erlaeuterung|erklaerung/i.test(x));
   return k ? String(props[k] ?? '').trim() : '';
 }
+function buildStreetGrid(){                       // Segment-Mittelpunkte indexieren, statt bei jeder
+  const pts = [];                                  // Suche alle Segmente aller Strassen durchzugehen
+  for(const f of streetFeats) for(const [a,b] of f.segs)
+    pts.push({ x:(a.e+b.e)/2, y:(a.n+b.n)/2, f, a, b });
+  return buildGrid(pts);
+}
 function nearestStreet(){                        // nächstgelegene Teilstrecke zur eigenen (absoluten) Position
-  if(!pos || !streetFeats.length) return null;
+  if(!pos || !streetGrid) return null;
+  const cand = candidatesFor([{ x:pos.e, y:pos.n }], CFG.streets.matchRadius, streetGrid);
   let best = null, bestD = CFG.streets.matchRadius;
-  for(const f of streetFeats){
-    for(const [a,b] of f.segs){
-      const d = distToSeg(pos.e, pos.n, a.e, a.n, b.e, b.n);
-      if(d < bestD){ bestD = d; best = { f, a, b }; }
-    }
+  for(const p of cand){
+    const d = distToSeg(pos.e, pos.n, p.a.e, p.a.n, p.b.e, p.b.n);
+    if(d < bestD){ bestD = d; best = { f: p.f, a: p.a, b: p.b }; }
   }
   return best;
 }
