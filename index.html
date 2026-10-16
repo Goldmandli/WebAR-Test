@@ -409,6 +409,12 @@ function nearestStreet(){                        // nächstgelegene Teilstrecke 
   }
   return best;
 }
+let streetMatchCache = null, streetMatchT = 0;
+function nearestStreetThrottled(){                // die volle Suche ist bei vielen Strassenabschnitten
+  const now = performance.now();                  // spürbar teuer – für die Strassenwahl reichen ~6×/s
+  if(now - streetMatchT > 150){ streetMatchCache = nearestStreet(); streetMatchT = now; }
+  return streetMatchCache;
+}
 function streetLabelTexture(name){                // Text einmal pro Name auf eine Offscreen-Canvas rendern
   let lbl = streetLabelCache.get(name);
   if(lbl) return lbl;
@@ -643,7 +649,19 @@ function draw(){
       const isT = b === target, info = ageInfo(b.f.props);
       const col = isNaN(info.year) ? '#aaa' : yearColor(info.year);
 
-      layerCtx.clearRect(0, 0, layerCv.width, layerCv.height);
+      // Begrenzungsrahmen dieses Gebäudes auf dem Bildschirm: alle Canvas-Operationen unten nur auf
+      // diesem kleinen Ausschnitt statt der ganzen Fläche ausführen – bei vielen Gebäuden spart das
+      // enorm viele Pixel-Operationen pro Frame (vorher voller Screen × Gebäude × 3 Operationen).
+      let bx0=Infinity, by0=Infinity, bx1=-Infinity, by1=-Infinity;
+      for(const q of b._quads) for(const v of q){
+        if(v.x<bx0) bx0=v.x; if(v.x>bx1) bx1=v.x; if(v.y<by0) by0=v.y; if(v.y>by1) by1=v.y;
+      }
+      bx0 = Math.max(0, Math.floor(bx0)-2); by0 = Math.max(0, Math.floor(by0)-2);
+      bx1 = Math.min(cv.width, Math.ceil(bx1)+2); by1 = Math.min(cv.height, Math.ceil(by1)+2);
+      const bw = bx1-bx0, bh = by1-by0;
+      if(bw <= 0 || bh <= 0) continue;
+
+      layerCtx.clearRect(bx0, by0, bw, bh);
       layerCtx.globalCompositeOperation = 'source-over';
       for(const q of b._quads){
         layerCtx.beginPath(); q.forEach((v,k) => k ? layerCtx.lineTo(v.x,v.y) : layerCtx.moveTo(v.x,v.y)); layerCtx.closePath();
@@ -653,9 +671,9 @@ function draw(){
       }
       // den Teil wieder entfernen, der schon von einem näheren Gebäude belegt ist
       layerCtx.globalCompositeOperation = 'destination-out';
-      layerCtx.globalAlpha = 1; layerCtx.drawImage(occCv, 0, 0);
+      layerCtx.globalAlpha = 1; layerCtx.drawImage(occCv, bx0,by0,bw,bh, bx0,by0,bw,bh);
       layerCtx.globalCompositeOperation = 'source-over';
-      ctx.globalAlpha = 1; ctx.drawImage(layerCv, 0, 0);
+      ctx.globalAlpha = 1; ctx.drawImage(layerCv, bx0,by0,bw,bh, bx0,by0,bw,bh);
 
       // eigene Fläche als "belegt" markieren, damit weiter entfernte Gebäude dort nicht mehr zeichnen
       occCtx.globalAlpha = 1; occCtx.fillStyle = '#000';
@@ -701,7 +719,7 @@ function draw(){
   // gerade steht, beginnend ein Stück vor einem und in Strassenrichtung in die Ferne gezogen. Der
   // schwarze "i"-Knopf erscheint erst, wenn das Fadenkreuz (Bildschirmmitte) genau auf dem Schild liegt.
   let streetVisible = false;
-  const cur = pos ? nearestStreet() : null;
+  const cur = pos ? nearestStreetThrottled() : null;
   if(cur){
     let dx = cur.b.e - cur.a.e, dy = cur.b.n - cur.a.n;
     const len = Math.hypot(dx,dy) || 1; dx /= len; dy /= len;
@@ -709,23 +727,34 @@ function draw(){
     if(dx*fwdX + dy*fwdY < 0){ dx = -dx; dy = -dy; }           // immer von der Kamera weg ausrichten
     const px = -dy, py = dx;                                   // Senkrechte zur Strasse
 
-    const nameLen = Math.max(6, Math.min(18, cur.f.name.length * 0.85));
+    const nameLen = Math.max(5, Math.min(10, cur.f.name.length * 0.6));
     const nearD = CFG.streets.nearDist, farD = nearD + nameLen, hw = CFG.streets.labelWidth/2;
-    const nearPt = { x: dx*nearD, y: dy*nearD }, farPt = { x: dx*farD, y: dy*farD };
-    const nearLeft  = adjust(project(nearPt.x - px*hw, nearPt.y - py*hw, 0));
-    const nearRight = adjust(project(nearPt.x + px*hw, nearPt.y + py*hw, 0));
-    const farLeft    = adjust(project(farPt.x - px*hw, farPt.y - py*hw, 0));
-    const farRight   = adjust(project(farPt.x + px*hw, farPt.y + py*hw, 0));
+    const lbl = streetLabelTexture(cur.f.name);
 
-    if(nearLeft && nearRight && farLeft && farRight){
-      const lbl = streetLabelTexture(cur.f.name);
-      const nl = [nearLeft.x,nearLeft.y], nr = [nearRight.x,nearRight.y], fl = [farLeft.x,farLeft.y], fr = [farRight.x,farRight.y];
-      // Quelltextur: x-Achse = entlang der Strasse (nah→fern), y-Achse = quer zur Strasse (links→rechts)
-      drawTexTriangle(ctx, lbl.cv, [0,0],[lbl.w,0],[0,lbl.h], nl, fl, nr);
-      drawTexTriangle(ctx, lbl.cv, [lbl.w,lbl.h],[lbl.w,0],[0,lbl.h], fr, fl, nr);
-
+    // Statt EINES grossen, über die ganze Länge gespannten Textur-Vierecks (das bei flachem Blickwinkel
+    // sichtbar verzerrt/"gefaltet" aussah) schneiden wir die Strecke in kurze Scheiben und projizieren
+    // jede einzeln – eine grobe, aber robuste Annäherung an die echte perspektivische Verzerrung.
+    const N = 14;
+    let pts = [];                                 // je Scheiben-Grenze: linker/rechter Bildschirmpunkt
+    for(let i=0; i<=N; i++){
+      const t = i/N, d = nearD + (farD-nearD)*t;
+      const cx = dx*d, cy = dy*d;
+      const l = adjust(project(cx - px*hw, cy - py*hw, 0));
+      const r = adjust(project(cx + px*hw, cy + py*hw, 0));
+      pts.push(l && r ? { l, r } : null);
+    }
+    let allOk = true;
+    for(let i=0; i<N; i++){
+      const a = pts[i], b = pts[i+1];
+      if(!a || !b){ allOk = false; continue; }
+      const su0 = lbl.w*i/N, su1 = lbl.w*(i+1)/N;
+      drawTexTriangle(ctx, lbl.cv, [su0,0],[su1,0],[su0,lbl.h], [a.l.x,a.l.y],[b.l.x,b.l.y],[a.r.x,a.r.y]);
+      drawTexTriangle(ctx, lbl.cv, [su1,lbl.h],[su1,0],[su0,lbl.h], [b.r.x,b.r.y],[b.l.x,b.l.y],[a.r.x,a.r.y]);
+    }
+    if(allOk && cur.f.erl){
+      const nearLeft = pts[0].l, nearRight = pts[0].r, farLeft = pts[N].l, farRight = pts[N].r;
       const cxS2 = cv.width/2, cyS2 = cv.height/2;
-      if(cur.f.erl && pointInPoly(cxS2, cyS2, [nearLeft, farLeft, farRight, nearRight])){
+      if(pointInPoly(cxS2, cyS2, [nearLeft, farLeft, farRight, nearRight])){
         streetVisible = true; streetShown = cur.f;
         const mx = (nearLeft.x+nearRight.x+farLeft.x+farRight.x)/4, my = (nearLeft.y+nearRight.y+farLeft.y+farRight.y)/4;
         $('streetBtn').style.left = (mx/devicePixelRatio) + 'px';
