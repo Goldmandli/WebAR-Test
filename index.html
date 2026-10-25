@@ -759,8 +759,10 @@ function draw(){
     for(let i=0; i<=N; i++){
       const t = i/N, d = nearD + (farD-nearD)*t;
       const cx = dx*d, cy = dy*d;
-      const l = adjust(project(cx - px*hw, cy - py*hw, 0));
-      const r = adjust(project(cx + px*hw, cy + py*hw, 0));
+      // (px,py) ist die LINKE Senkrechte zur Blickrichtung → Buchstaben-Oberkante (Textur oben) liegt links.
+      // Mit vertauschten Vorzeichen wäre der Text spiegelverkehrt (Lesen von hinten nach vorne).
+      const l = adjust(project(cx + px*hw, cy + py*hw, 0));
+      const r = adjust(project(cx - px*hw, cy - py*hw, 0));
       pts.push(l && r ? { l, r } : null);
     }
     let allOk = true;
