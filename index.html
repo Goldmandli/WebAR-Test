@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>Gebäudealter AR – mit Adresse</title>
+<title>Gebäudealter AR</title>
 <link rel="manifest" href="manifest.json">
 <meta name="theme-color" content="#111111">
 <!-- Android/Chrome: Symbol fürs Homescreen-Icon -->
@@ -23,12 +23,37 @@
   video,canvas{position:fixed;inset:0;width:100%;height:100%}
   video{object-fit:cover}
   canvas{touch-action:none}
-  #start{position:fixed;inset:0;display:flex;flex-direction:column;gap:14px;align-items:center;justify-content:center;background:#111;z-index:5;padding:24px;text-align:center}
-  #start button,#start label{background:#f2c14e;color:#111;border:0;padding:14px 22px;border-radius:10px;font-size:16px;font-weight:600}
-  #start small{opacity:.7;max-width:36ch}
-  #hud{position:fixed;left:0;right:0;bottom:0;padding:10px 14px calc(10px + env(safe-area-inset-bottom,0px));background:rgba(0,0,0,.55);z-index:4;font-size:13px}
-  #hud input{width:100%}
-  #dbg{opacity:.7;font-size:11px;word-break:break-all}
+  :root{--glass:rgba(14,17,23,.62);--line:rgba(255,255,255,.12);--muted:rgba(255,255,255,.62)}
+  #start{position:fixed;inset:0;display:flex;flex-direction:column;gap:18px;align-items:center;justify-content:center;
+    background:radial-gradient(120% 80% at 50% 0%,#1b2230 0%,#0d1117 60%);z-index:5;padding:32px;text-align:center}
+  #start img{width:96px;height:96px;border-radius:22px;box-shadow:0 10px 30px rgba(0,0,0,.5)}
+  #start h2{margin:0;font-size:26px;font-weight:700;letter-spacing:-.01em}
+  #start p{margin:0;max-width:30ch;color:var(--muted);line-height:1.5}
+  #go{border:0;border-radius:14px;padding:15px 34px;font-size:17px;font-weight:700;color:#0d1117;
+    background:linear-gradient(90deg,#8fd6a5,#fde725);box-shadow:0 6px 20px rgba(253,231,37,.25)}
+  #msg{color:var(--muted);font-size:13px;min-height:1.2em}
+  .glass{background:var(--glass);border:1px solid var(--line);-webkit-backdrop-filter:blur(14px) saturate(1.2);backdrop-filter:blur(14px) saturate(1.2)}
+  #hud{position:fixed;left:10px;right:10px;bottom:calc(10px + env(safe-area-inset-bottom,0px));z-index:4;
+    border-radius:20px;padding:12px 16px 14px;font-variant-numeric:tabular-nums}
+  #note{display:none;text-align:center;font-size:13px;color:#ffd479;margin-bottom:8px}
+  .stats{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;text-align:center;margin-bottom:12px}
+  .stats b{display:block;font-size:22px;font-weight:650;line-height:1.15}
+  .stats span{font-size:11px;color:var(--muted)}
+  .stats div+div{border-left:1px solid var(--line)}
+  #leg{height:8px;border-radius:4px}
+  .legl{display:flex;justify-content:space-between;font-size:11px;color:var(--muted);margin-top:5px}
+  #gear{position:fixed;top:calc(12px + env(safe-area-inset-top,0px));right:12px;z-index:4;width:42px;height:42px;
+    border-radius:50%;color:#fff;font-size:20px;line-height:1;display:flex;align-items:center;justify-content:center;padding:0}
+  #sheet{position:fixed;top:calc(62px + env(safe-area-inset-top,0px));right:12px;z-index:4;width:min(320px,calc(100vw - 24px));
+    border-radius:18px;padding:14px 16px;display:none;font-size:13px}
+  #sheet label{display:flex;justify-content:space-between;color:var(--muted);margin-bottom:6px}
+  #sheet input[type=range]{width:100%;accent-color:#5ec962}
+  #sheet .row{display:flex;gap:10px;align-items:center;margin-top:12px}
+  #sheet .row span{flex:1;color:var(--muted);font-size:12px;line-height:1.35}
+  #reset{background:rgba(255,255,255,.1);color:#fff;border:1px solid var(--line);border-radius:10px;padding:8px 12px}
+  #sheet details{margin-top:12px;color:var(--muted);font-size:11px}
+  #sheet summary{cursor:pointer}
+  #detail,#dbg{margin-top:6px;word-break:break-word;font-size:11px;opacity:.85}
   #plaqueBtn{position:fixed;width:34px;height:34px;border-radius:50%;background:#2b6fde;color:#fff;
     border:2px solid #fff;font-weight:800;font-size:16px;display:none;align-items:center;justify-content:center;
     z-index:6;box-shadow:0 2px 6px rgba(0,0,0,.5);transform:translate(-50%,-50%)}
@@ -45,10 +70,11 @@
 </head>
 <body>
 <div id="start">
-  <h2 style="margin:0">Gebäudealter AR</h2>
-  <small>Kamera, Standort und Kompass werden benötigt. Halte das Handy aufrecht und ziele auf ein Haus. Daten: Gebäudealter (OGD) Kanton Zürich, Adresse (GWR) swisstopo, blaue Tafeln Stadt Zürich.</small>
+  <img src="icons/icon-192.png" alt="">
+  <h2>Gebäudealter AR</h2>
+  <p>Richte die Kamera auf ein Haus und sieh, wann es gebaut wurde.</p>
   <button id="go">Starten</button>
-  <small id="msg"></small>
+  <div id="msg">Kamera, Standort und Kompass werden benötigt.</div>
 </div>
 <video id="v" playsinline muted></video>
 <canvas id="c"></canvas>
@@ -60,17 +86,25 @@
   <p id="plaqueText"></p>
   <div id="plaqueRaw" style="opacity:.5;font-size:10px;word-break:break-all;max-width:90vw"></div>
 </div>
-<div id="hud">
-  <div id="leg" style="height:10px;border-radius:3px"></div>
-  <div style="display:flex;justify-content:space-between;font-size:11px;opacity:.75;margin-bottom:4px"><span id="legMin">vor 1850</span><span id="legMax">heute</span></div>
-  <div id="status">Warte auf GPS …</div>
-  <div id="dbg"></div>
-  Sichtfeld (horizontal): <span id="fovv">55</span>°
+<button id="gear" class="glass" aria-label="Einstellungen">⚙</button>
+<div id="sheet" class="glass">
+  <label>Sichtfeld <span><span id="fovv">55</span>°</span></label>
   <input id="fov" type="range" min="35" max="90" value="55">
-  <div style="display:flex;gap:8px;align-items:center;margin-top:6px">
-    <span style="flex:1;opacity:.8">Mit 1 Finger verschieben, mit 2 Fingern zoomen</span>
-    <button id="reset" style="background:#333;color:#fff;border:1px solid #666;border-radius:8px;padding:6px 10px">Zurücksetzen</button>
+  <div class="row">
+    <span>Mit 1 Finger verschieben, mit 2 Fingern zoomen, um die Umrisse anzupassen.</span>
+    <button id="reset">Zurücksetzen</button>
   </div>
+  <details><summary>Technische Details</summary><div id="detail"></div><div id="dbg"></div></details>
+</div>
+<div id="hud" class="glass">
+  <div id="note">Warte auf GPS …</div>
+  <div class="stats">
+    <div><b id="stB">–</b><span>Gebäude</span></div>
+    <div><b id="stH">–</b><span>Blickrichtung</span></div>
+    <div><b id="stG">–</b><span>GPS-Genauigkeit</span></div>
+  </div>
+  <div id="leg"></div>
+  <div class="legl"><span id="legMin">vor 1850</span><span id="legMax">heute</span></div>
 </div>
 
 <script>
@@ -137,7 +171,7 @@ const CFG = {
 /* ===== Zustand ===== */
 let feats = [], pos = null, posWGS = null, lastFetch = null, lastHeightFetch = null, busy = false, heightsBusy = false;
 let heading = 0, pitch = 0, hfov = 55, yearKey = null;
-let lastFixTime = null, gpsAcc = null;   // für die genauigkeitsgewichtete GPS-Glättung
+let lastFixTime = null, gpsAcc = null, gpsErr = '';   // für die genauigkeitsgewichtete GPS-Glättung
 let occCv = null, occCtx = null, layerCv = null, layerCtx = null;   // Offscreen-Canvases für die Verdeckung hinterer Gebäude
 let streetFeats = [], streetGrid = new Map(), streetsBusy = false, lastStreetFetch = null, streetDbg = '';
 let streetShown = null;                          // für das Infofenster (Name + Namensherkunft)
@@ -881,15 +915,22 @@ async function start(){
       lastFixTime = now; gpsAcc = acc;
       if(!lastFetch || Math.hypot(c.e-lastFetch.e, c.n-lastFetch.n) > CFG.refetchDist) fetchData();
       refreshSecondary();
-    }, err => $('status').textContent = 'GPS-Fehler: ' + err.message, { enableHighAccuracy:true, maximumAge:1000 });
-    setInterval(() => $('status').textContent = pos
-      ? `GPS ±${Math.round(acc)} m · Blick ${Math.round(heading)}° · ${feats.length} Gebäude · ${heightsInCity ? heightDbg : '3D-Höhen: ausserhalb Stadt ZH'} · ${plaqueDbg} · ${addressDbg} · ${streetDbg}`
-      : 'Warte auf GPS …', 400);
+    }, err => { gpsErr = 'GPS-Fehler: ' + err.message; }, { enableHighAccuracy:true, maximumAge:1000 });
+    setInterval(() => {
+      const dirs = ['N','NO','O','SO','S','SW','W','NW'];
+      const note = gpsErr || (pos ? '' : 'Warte auf GPS …');
+      $('note').textContent = note; $('note').style.display = note ? 'block' : 'none';
+      $('stB').textContent = pos ? feats.length : '–';
+      $('stH').textContent = Math.round(heading) + '° ' + dirs[Math.round(heading/45) % 8];
+      $('stG').textContent = pos ? '±' + Math.round(acc) + ' m' : '–';
+      $('detail').textContent = `${heightsInCity ? heightDbg : '3D-Höhen: ausserhalb Stadt ZH'} · ${plaqueDbg} · ${addressDbg} · ${streetDbg}`;
+    }, 400);
     $('start').style.display = 'none';
     draw();
   }catch(e){ $('msg').textContent = 'Fehler: ' + e.message + ' (HTTPS nötig!)'; }
 }
 $('go').onclick = start;
+$('gear').onclick = () => { const sh = $('sheet'); sh.style.display = sh.style.display === 'block' ? 'none' : 'block'; };
 $('fov').oninput = e => { hfov = +e.target.value; $('fovv').textContent = hfov; };
 $('reset').onclick = () => { userDX = 0; userDY = 0; userScale = 1; };
 
