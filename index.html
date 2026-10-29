@@ -46,13 +46,11 @@
     border-radius:50%;color:#fff;font-size:20px;line-height:1;display:flex;align-items:center;justify-content:center;padding:0}
   #sheet{position:fixed;top:calc(62px + env(safe-area-inset-top,0px));right:12px;z-index:4;width:min(320px,calc(100vw - 24px));
     border-radius:18px;padding:14px 16px;display:none;font-size:13px}
-  #sheet label{display:flex;justify-content:space-between;color:var(--muted);margin-bottom:6px}
-  #sheet input[type=range]{width:100%;accent-color:#5ec962}
-  #sheet .row{display:flex;gap:10px;align-items:center;margin-top:12px}
-  #sheet .row span{flex:1;color:var(--muted);font-size:12px;line-height:1.35}
-  #reset{background:rgba(255,255,255,.1);color:#fff;border:1px solid var(--line);border-radius:10px;padding:8px 12px}
-  #sheet details{margin-top:12px;color:var(--muted);font-size:11px}
-  #sheet summary{cursor:pointer}
+  .ctrl{display:flex;align-items:center;gap:10px;margin-top:12px;padding-top:12px;border-top:1px solid var(--line)}
+  .fovl{font-size:12px;color:var(--muted);white-space:nowrap}
+  .fovl b{color:#fff;font-weight:600}
+  .ctrl input[type=range]{flex:1;min-width:0;accent-color:#5ec962}
+  #reset{background:rgba(255,255,255,.1);color:#fff;border:1px solid var(--line);border-radius:10px;padding:7px 11px;font-size:12px;white-space:nowrap}
   #detail,#dbg{margin-top:6px;word-break:break-word;font-size:11px;opacity:.85}
   #plaqueBtn{position:fixed;width:34px;height:34px;border-radius:50%;background:#2b6fde;color:#fff;
     border:2px solid #fff;font-weight:800;font-size:16px;display:none;align-items:center;justify-content:center;
@@ -88,13 +86,8 @@
 </div>
 <button id="gear" class="glass" aria-label="Einstellungen">⚙</button>
 <div id="sheet" class="glass">
-  <label>Sichtfeld <span><span id="fovv">55</span>°</span></label>
-  <input id="fov" type="range" min="35" max="90" value="55">
-  <div class="row">
-    <span>Mit 1 Finger verschieben, mit 2 Fingern zoomen, um die Umrisse anzupassen.</span>
-    <button id="reset">Zurücksetzen</button>
-  </div>
-  <details><summary>Technische Details</summary><div id="detail"></div><div id="dbg"></div></details>
+  <div style="color:var(--muted);margin-bottom:4px">Technische Details</div>
+  <div id="detail"></div><div id="dbg"></div>
 </div>
 <div id="hud" class="glass">
   <div id="note">Warte auf GPS …</div>
@@ -105,6 +98,11 @@
   </div>
   <div id="leg"></div>
   <div class="legl"><span id="legMin">vor 1850</span><span id="legMax">heute</span></div>
+  <div class="ctrl">
+    <span class="fovl">Sichtfeld <b id="fovv">55</b>°</span>
+    <input id="fov" type="range" min="35" max="90" value="55">
+    <button id="reset">Zurücksetzen</button>
+  </div>
 </div>
 
 <script>
