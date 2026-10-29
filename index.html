@@ -302,21 +302,37 @@ async function fetchAddresses(){
   const r = CFG.addresses.fetchRadius;
   const dLat = r/111320, dLon = r/(111320*Math.cos(posWGS.lat*rad));
   const bbox = [posWGS.lon-dLon, posWGS.lat-dLat, posWGS.lon+dLon, posWGS.lat+dLat].join(',');
-  const url = `${CFG.addresses.url}?SERVICE=WFS&VERSION=1.0.0&REQUEST=GetFeature&TYPENAME=${CFG.addresses.layer}` +
-    `&OUTPUTFORMAT=${encodeURIComponent('application/vnd.geo+json')}&BBOX=${bbox}&MAXFEATURES=${CFG.addresses.maxFeatures}`;
+  const base = `${CFG.addresses.url}?SERVICE=WFS&VERSION=1.0.0&REQUEST=GetFeature&TYPENAME=${CFG.addresses.layer}` +
+    `&OUTPUTFORMAT=${encodeURIComponent('application/vnd.geo+json')}&MAXFEATURES=${CFG.addresses.maxFeatures}`;
+  // Zweiter Weg: Die Geometrie der Adressschicht kann leer sein (geometrie_gdo = null), dann findet die BBOX nichts.
+  // Die Koordinaten stehen aber auch als Attribute (LV95: hausnummer_koord_ost/nord) – darüber filtern wir dann.
+  const c0 = wgs2lv95(posWGS.lat, posWGS.lon);
+  const between = (f, lo, hi) => `<PropertyIsBetween><PropertyName>${f}</PropertyName><LowerBoundary><Literal>${lo}</Literal></LowerBoundary><UpperBoundary><Literal>${hi}</Literal></UpperBoundary></PropertyIsBetween>`;
+  const filter = `<Filter xmlns="http://www.opengis.net/ogc"><And>${between('hausnummer_koord_ost', Math.round(c0.e-r), Math.round(c0.e+r))}${between('hausnummer_koord_nord', Math.round(c0.n-r), Math.round(c0.n+r))}</And></Filter>`;
   try{
     const t0 = performance.now();
-    const res = await fetch(url); if(!res.ok) throw new Error('HTTP ' + res.status); const gj = await res.json();
+    let via = 'BBOX';
+    let res = await fetch(`${base}&BBOX=${bbox}`); if(!res.ok) throw new Error('HTTP ' + res.status);
+    let gj = await res.json();
+    if(!(gj.features || []).length){
+      via = 'Attribut-Filter';
+      res = await fetch(`${base}&FILTER=${encodeURIComponent(filter)}`); if(!res.ok) throw new Error('HTTP ' + res.status);
+      gj = await res.json();
+    }
     const pts = [];
     for(const f of gj.features || []){
-      const g = f.geometry; if(!g || g.type !== 'Point') continue;
-      const [lon,lat] = g.coordinates, c = wgs2lv95(lat,lon);
-      pts.push({ x: c.e-pos.e, y: c.n-pos.n, props: f.properties || {} });
+      const pr = f.properties || {}, g = f.geometry;
+      let e, n;
+      if(g && g.type === 'Point'){ const w = wgs2lv95(g.coordinates[1], g.coordinates[0]); e = w.e; n = w.n; }
+      else if(pr.hausnummer_koord_ost != null && pr.hausnummer_koord_nord != null){ e = +pr.hausnummer_koord_ost; n = +pr.hausnummer_koord_nord; }
+      else if(pr.hausnummer_koord_lat != null && pr.hausnummer_koord_long != null){ const w = wgs2lv95(+pr.hausnummer_koord_lat, +pr.hausnummer_koord_long); e = w.e; n = w.n; }
+      else continue;
+      pts.push({ x: e-pos.e, y: n-pos.n, props: pr });
     }
     addressFeats = pts; lastAddressFetch = { lat:posWGS.lat, lon:posWGS.lon };
     addressGrid = buildGrid(pts);
     assignAddresses();
-    addressDbg = `${pts.length} Adresspunkte · ${Math.round(performance.now()-t0)} ms`;
+    addressDbg = `${pts.length} Adresspunkte (${via}, ${(gj.features||[]).length} roh) · ${Math.round(performance.now()-t0)} ms`;
   }catch(e){
     addressDbg = 'Adressen: Abfrage fehlgeschlagen (' + e.message + ')'; secFailUntil.addresses = performance.now() + 10000;
     addressFeats = []; addressGrid = new Map();
