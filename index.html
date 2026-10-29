@@ -182,7 +182,7 @@ async function fetchData(){
     `&SRSNAME=${crs}&OUTPUTFORMAT=${encodeURIComponent('application/json; subtype=geojson')}&COUNT=2000` +
     `&BBOX=${pos.e-r},${pos.n-r},${pos.e+r},${pos.n+r},${crs}`;
   try{
-    const res = await fetch(url); const gj = await res.json();
+    const res = await fetch(url); if(!res.ok) throw new Error('HTTP ' + res.status); const gj = await res.json();
     feats = parseGeoJSON(gj, false); lastFetch = { e:pos.e, n:pos.n };
     yearKey = null; assignHeights(); assignPlaques(); assignAddresses();
     $('msg').textContent = feats.length + ' Gebäude geladen';
@@ -215,7 +215,7 @@ async function fetchHeights(){
     `&OUTPUTFORMAT=${encodeURIComponent('application/vnd.geo+json')}&BBOX=${bbox}&MAXFEATURES=${CFG.heights.maxFeatures}`;
   try{
     const t0 = performance.now();
-    const res = await fetch(url); const gj = await res.json();
+    const res = await fetch(url); if(!res.ok) throw new Error('HTTP ' + res.status); const gj = await res.json();
     const pts = [];
     for(const f of gj.features || []){
       if(!f.geometry) continue;
@@ -231,7 +231,7 @@ async function fetchHeights(){
     assignHeights();                              // einmalig berechnen & auf den Gebäuden cachen, nicht pro Frame
     heightDbg = `${pts.length} 3D-Punkte · ${Math.round(performance.now()-t0)} ms`;
   }catch(e){
-    heightDbg = '3D-Höhen: Abfrage fehlgeschlagen (' + e.message + ') – Rückfall auf Standardhöhe';
+    heightDbg = '3D-Höhen: Abfrage fehlgeschlagen (' + e.message + ') – Rückfall auf Standardhöhe'; secFailUntil.heights = performance.now() + 10000;
     heightFeats = []; heightGrid = new Map();
   }
   heightsBusy = false;
@@ -306,7 +306,7 @@ async function fetchAddresses(){
     `&OUTPUTFORMAT=${encodeURIComponent('application/vnd.geo+json')}&BBOX=${bbox}&MAXFEATURES=${CFG.addresses.maxFeatures}`;
   try{
     const t0 = performance.now();
-    const res = await fetch(url); const gj = await res.json();
+    const res = await fetch(url); if(!res.ok) throw new Error('HTTP ' + res.status); const gj = await res.json();
     const pts = [];
     for(const f of gj.features || []){
       const g = f.geometry; if(!g || g.type !== 'Point') continue;
@@ -318,7 +318,7 @@ async function fetchAddresses(){
     assignAddresses();
     addressDbg = `${pts.length} Adresspunkte · ${Math.round(performance.now()-t0)} ms`;
   }catch(e){
-    addressDbg = 'Adressen: Abfrage fehlgeschlagen (' + e.message + ')';
+    addressDbg = 'Adressen: Abfrage fehlgeschlagen (' + e.message + ')'; secFailUntil.addresses = performance.now() + 10000;
     addressFeats = []; addressGrid = new Map();
   }
   addressesBusy = false;
@@ -365,7 +365,7 @@ async function fetchStreets(){
     `&OUTPUTFORMAT=${encodeURIComponent('application/vnd.geo+json')}&BBOX=${bbox}&MAXFEATURES=${CFG.streets.maxFeatures}`;
   try{
     const t0 = performance.now();
-    const res = await fetch(url); const gj = await res.json();
+    const res = await fetch(url); if(!res.ok) throw new Error('HTTP ' + res.status); const gj = await res.json();
     // Die WFS-BBOX filtert nur, WELCHE Strassen zurückkommen – jede Linie wird dabei aber in voller
     // Länge (ganze Strasse, oft hunderte Stützpunkte) geliefert, nicht auf die Umgebung zugeschnitten.
     // Das hat Laden und die Suche pro Frame stark verlangsamt. Deshalb hier zuschneiden (nur Punkte
@@ -398,7 +398,7 @@ async function fetchStreets(){
     streetFeats = out; streetGrid = buildStreetGrid(); lastStreetFetch = { lat:posWGS.lat, lon:posWGS.lon };
     streetDbg = `${out.length} Strassen/${totalSegs} Abschnitte · ${Math.round(performance.now()-t0)} ms`;
   }catch(e){
-    streetDbg = 'Strassen: Abfrage fehlgeschlagen (' + e.message + ')';
+    streetDbg = 'Strassen: Abfrage fehlgeschlagen (' + e.message + ')'; secFailUntil.streets = performance.now() + 10000;
     streetFeats = []; streetGrid = new Map();
   }
   streetsBusy = false;
@@ -485,7 +485,7 @@ async function fetchPlaques(){
     `&OUTPUTFORMAT=${encodeURIComponent('application/vnd.geo+json')}&BBOX=${bbox}&MAXFEATURES=${CFG.plaques.maxFeatures}`;
   try{
     const t0 = performance.now();
-    const res = await fetch(url); const gj = await res.json();
+    const res = await fetch(url); if(!res.ok) throw new Error('HTTP ' + res.status); const gj = await res.json();
     const pts = [];
     for(const f of gj.features || []){
       const g = f.geometry; if(!g || g.type !== 'Point') continue;
@@ -497,7 +497,7 @@ async function fetchPlaques(){
     assignPlaques();
     plaqueDbg = `${pts.length} Tafelpunkte · ${Math.round(performance.now()-t0)} ms`;
   }catch(e){
-    plaqueDbg = 'Tafeln: Abfrage fehlgeschlagen (' + e.message + ')';
+    plaqueDbg = 'Tafeln: Abfrage fehlgeschlagen (' + e.message + ')'; secFailUntil.plaques = performance.now() + 10000;
     plaqueFeats = []; plaqueGrid = new Map();
   }
   plaquesBusy = false;
@@ -809,6 +809,22 @@ function onOrient(e){
   heading = smooth(heading, h);
   if(e.beta != null) pitch = pitch*0.75 + (e.beta - 90)*0.25;
 }
+/* Nebenabrufe (Höhen, Tafeln, Adressen, Strassen) gehen alle an denselben Stadt-Zürich-Server. Gleichzeitig
+   abgefeuert wurden sie teils abgelehnt/gedrosselt, und bei einem Fehler wurde jede Sekunde neu versucht.
+   Jetzt: strikt nacheinander, und nach einem Fehler 10 s Pause für diesen Abruf. */
+const secFailUntil = {};
+let secBusy = false;
+async function refreshSecondary(){
+  if(secBusy || !posWGS) return; secBusy = true;
+  const far = last => !last || Math.hypot(posWGS.lat-last.lat, posWGS.lon-last.lon)*111320 > CFG.refetchDist;
+  const ok = name => performance.now() >= (secFailUntil[name] || 0);
+  try{
+    if(far(lastAddressFetch) && ok('addresses')) await fetchAddresses();
+    if(far(lastHeightFetch)  && ok('heights'))   await fetchHeights();
+    if(far(lastStreetFetch)  && ok('streets'))   await fetchStreets();
+    if(far(lastPlaqueFetch)  && ok('plaques'))   await fetchPlaques();
+  } finally { secBusy = false; }
+}
 async function start(){
   try{
     if(typeof DeviceOrientationEvent !== 'undefined' && DeviceOrientationEvent.requestPermission){
@@ -840,17 +856,10 @@ async function start(){
       }
       lastFixTime = now; gpsAcc = acc;
       if(!lastFetch || Math.hypot(c.e-lastFetch.e, c.n-lastFetch.n) > CFG.refetchDist) fetchData();
-      if(!lastHeightFetch || Math.hypot(posWGS.lat-lastHeightFetch.lat, posWGS.lon-lastHeightFetch.lon)*111320 > CFG.refetchDist)
-        fetchHeights();
-      if(!lastPlaqueFetch || Math.hypot(posWGS.lat-lastPlaqueFetch.lat, posWGS.lon-lastPlaqueFetch.lon)*111320 > CFG.refetchDist)
-        fetchPlaques();
-      if(!lastAddressFetch || Math.hypot(posWGS.lat-lastAddressFetch.lat, posWGS.lon-lastAddressFetch.lon)*111320 > CFG.refetchDist)
-        fetchAddresses();
-      if(!lastStreetFetch || Math.hypot(posWGS.lat-lastStreetFetch.lat, posWGS.lon-lastStreetFetch.lon)*111320 > CFG.refetchDist)
-        fetchStreets();
+      refreshSecondary();
     }, err => $('status').textContent = 'GPS-Fehler: ' + err.message, { enableHighAccuracy:true, maximumAge:1000 });
     setInterval(() => $('status').textContent = pos
-      ? `GPS ±${Math.round(acc)} m · Blick ${Math.round(heading)}° · ${feats.length} Gebäude · ${heightsInCity ? heightDbg : '3D-Höhen: ausserhalb Stadt ZH'} · ${plaqueDbg} · ${streetDbg}`
+      ? `GPS ±${Math.round(acc)} m · Blick ${Math.round(heading)}° · ${feats.length} Gebäude · ${heightsInCity ? heightDbg : '3D-Höhen: ausserhalb Stadt ZH'} · ${plaqueDbg} · ${addressDbg} · ${streetDbg}`
       : 'Warte auf GPS …', 400);
     $('start').style.display = 'none';
     draw();
