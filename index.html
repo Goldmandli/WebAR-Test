@@ -204,6 +204,13 @@ function collectZ(coords, out){                  // Koordinaten-Array beliebiger
   if(typeof coords[0] === 'number'){ if(coords.length > 2) out.push(coords); return; }
   for(const c of coords) collectZ(c, out);
 }
+/* Der Server liefert Punkt-Layer teils als "Point", teils als "MultiPoint" ([[lon,lat,z]]). Erste Koordinate holen. */
+function firstLonLat(g){
+  if(!g || !g.coordinates) return null;
+  let c = g.coordinates;
+  while(Array.isArray(c) && Array.isArray(c[0])) c = c[0];
+  return Array.isArray(c) && c.length >= 2 && isFinite(c[0]) && isFinite(c[1]) ? [+c[0], +c[1]] : null;
+}
 async function fetchHeights(){
   if(heightsBusy || !posWGS || !inCity(posWGS.lat, posWGS.lon)){ heightsInCity = inCity(posWGS?.lat, posWGS?.lon); return; }
   heightsBusy = true; heightsInCity = true; heightDbg = '3D-Höhen: lädt …';
@@ -323,7 +330,8 @@ async function fetchAddresses(){
     for(const f of gj.features || []){
       const pr = f.properties || {}, g = f.geometry;
       let e, n;
-      if(g && g.type === 'Point'){ const w = wgs2lv95(g.coordinates[1], g.coordinates[0]); e = w.e; n = w.n; }
+      const ll = firstLonLat(g);
+      if(ll){ const w = wgs2lv95(ll[1], ll[0]); e = w.e; n = w.n; }
       else if(pr.hausnummer_koord_ost != null && pr.hausnummer_koord_nord != null){ e = +pr.hausnummer_koord_ost; n = +pr.hausnummer_koord_nord; }
       else if(pr.hausnummer_koord_lat != null && pr.hausnummer_koord_long != null){ const w = wgs2lv95(+pr.hausnummer_koord_lat, +pr.hausnummer_koord_long); e = w.e; n = w.n; }
       else continue;
@@ -504,8 +512,8 @@ async function fetchPlaques(){
     const res = await fetch(url); if(!res.ok) throw new Error('HTTP ' + res.status); const gj = await res.json();
     const pts = [];
     for(const f of gj.features || []){
-      const g = f.geometry; if(!g || g.type !== 'Point') continue;
-      const [lon,lat] = g.coordinates, c = wgs2lv95(lat,lon);
+      const ll = firstLonLat(f.geometry); if(!ll) continue;
+      const c = wgs2lv95(ll[1], ll[0]);
       pts.push({ x: c.e-pos.e, y: c.n-pos.n, props: f.properties || {} });
     }
     plaqueFeats = pts; lastPlaqueFetch = { lat:posWGS.lat, lon:posWGS.lon };
